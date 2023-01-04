@@ -177,6 +177,7 @@ public:
     size_t MAX_IO_SIZE = 4 * 1024 * 1024;
     uint64_t m_vsize = 0;
     vector<IFile *> m_files;
+    vector<IFile *> m_r_files;
     vector<UUID> m_uuid;
     IMemoryIndex *m_index = nullptr;
     bool m_file_ownership = false;
@@ -190,6 +191,8 @@ public:
         if (m_file_ownership) {
             LOG_DEBUG("m_file_ownership:`, m_files.size:`", m_file_ownership, m_files.size());
             for (auto &x : m_files)
+                safe_delete(x);
+            for (auto &x : m_r_files)
                 safe_delete(x);
         }
     }
@@ -216,8 +219,9 @@ public:
         safe_delete(m_index);
         if (m_file_ownership) {
             for (auto &x : m_files)
-                if (x)
-                    x->close();
+                if (x) x->close();
+            for (auto &x : m_r_files)
+                if (x) x->close();
         }
         return 0;
     }
@@ -247,6 +251,7 @@ public:
         LOG_ERROR_RETURN(EFAULT, -1, "arguments must be aligned!");
 
     virtual ssize_t pread(void *buf, size_t count, off_t offset) override {
+        LOG_INFO("pread ", VALUE(offset), VALUE(count));
         CHECK_ALIGNMENT(count, offset);
         auto nbytes = count;
         while (count > MAX_IO_SIZE) {
@@ -274,8 +279,14 @@ public:
                 }
                 assert(m.tag < m_files.size());
                 ssize_t size = m.length * ALIGNMENT;
-                // LOG_DEBUG("offset: `, length: `", m.moffset, size);
-                ssize_t ret = m_files[m.tag]->pread(buf, size, m.moffset * ALIGNMENT);
+                LOG_INFO("read segment, offset: `, length: `", m.moffset, size);
+                ssize_t ret = 0;
+                if (m.d_offset > 0) {
+                    LOG_INFO("read from remote file, offset `, size `", m.d_offset * ALIGNMENT, size);
+                    ret = m_r_files[m.tag]->pread(buf, size, m.d_offset * ALIGNMENT);
+                } else {
+                    ret = m_files[m.tag]->pread(buf, size, m.moffset * ALIGNMENT);
+                }
                 if (ret < size) {
                     LOG_ERRNO_RETURN(0, (int)ret,
                                      "failed to read from `-th file ( ` pread return: ` < size: `)",
@@ -316,6 +327,7 @@ public:
     }
     UNIMPLEMENTED(int close_seal(IFileRO **reopen_as = nullptr) override);
     UNIMPLEMENTED(int commit(const CommitArgs &args) const override);
+    UNIMPLEMENTED(int add_data_segment(off_t offset, size_t count, off_t d_offset) override);
 
     virtual DataStat data_stat() const override {
         uint64_t size = 0;
@@ -535,6 +547,10 @@ static int compact(const CompactOptions &opt, atomic_uint64_t &compacted_idx_siz
             m.moffset = moffset;
             compact_index.push_back(m);
             // there is no need do pcopy if current block is zero-marked.
+            continue;
+        }
+        if (m.d_offset != 0) {
+            compact_index.push_back(m);
             continue;
         }
         auto ret = pcopy(opt, m, moffset, compact_index);
@@ -828,6 +844,31 @@ public:
         return close();
     }
 
+    int add_data_segment(off_t offset, size_t count, off_t d_offset) override {
+        LOG_INFO("add segment {offset:`,length:`,roffset:`}", offset, count, d_offset);
+        CHECK_ALIGNMENT(count, offset);
+        auto bytes = count;
+
+        Lock lock(m_rw_mtx);
+        m_vsize = max(m_vsize, count + offset);
+        if (m_vsize < count + offset) {
+            LOG_INFO("resize m_visze: `->`", m_vsize, count + offset);
+        }
+        SegmentMapping m{
+            (uint64_t)offset / (uint64_t)ALIGNMENT,
+            (uint32_t)count / (uint32_t)ALIGNMENT,
+            0,
+            m_rw_tag,
+            (uint32_t)d_offset / (uint32_t)ALIGNMENT,
+        };
+        assert(m.length > (uint32_t)0);
+        m_data_offset = m.mend();
+        static_cast<IMemoryIndex0 *>(m_index)->insert(m);
+        append_index(m);
+
+        return bytes;
+    }
+
     virtual int fsync() override {
         {
             Lock lock(m_rw_mtx);
@@ -1036,7 +1077,7 @@ static SegmentMapping *do_load_index(IFile *file, HeaderTrailer *pheader_trailer
     return p;
 }
 
-static LSMTReadOnlyFile *open_file_ro(IFile *file, bool ownership, bool reserve_tag) {
+static LSMTReadOnlyFile *open_file_ro(IFile *file, bool ownership, bool reserve_tag, IFile *r_file) {
     if (!file) {
         LOG_ERROR("invalid file ptr. file: `", file);
         return nullptr;
@@ -1055,6 +1096,7 @@ static LSMTReadOnlyFile *open_file_ro(IFile *file, bool ownership, bool reserve_
     auto rst = new LSMTReadOnlyFile;
     rst->m_index = pi;
     rst->m_files = {file};
+    rst->m_r_files = {file};
     rst->m_uuid.resize(1);
     rst->m_uuid[0].parse(ht.uuid);
     rst->m_vsize = ht.virtual_size;
@@ -1064,8 +1106,8 @@ static LSMTReadOnlyFile *open_file_ro(IFile *file, bool ownership, bool reserve_
     return rst;
 }
 
-IFileRO *open_file_ro(IFile *file, bool ownership) {
-    return open_file_ro(file, ownership, true);
+IFileRO *open_file_ro(IFile *file, bool ownership, IFile *data_file) {
+    return open_file_ro(file, ownership, true, data_file);
 }
 
 IFileRW *open_file_rw(IFile *fdata, IFile *findex, bool ownership) {
@@ -1236,7 +1278,7 @@ void *do_parallel_load_index(void *param) {
 }
 
 static IMemoryIndex *load_merge_index(vector<IFile *> &files, vector<UUID> &uuid,
-                                      HeaderTrailer &ht) {
+                                      HeaderTrailer &ht, vector<IFile *> &data_files) {
     photon::join_handle *ths[PARALLEL_LOAD_INDEX];
     auto n = min(PARALLEL_LOAD_INDEX, (int)files.size());
     LOG_DEBUG("create ` photon threads to merge index", n);
@@ -1257,6 +1299,7 @@ static IMemoryIndex *load_merge_index(vector<IFile *> &files, vector<UUID> &uuid
     assert(tm.jobs.back().i == files.size() - 1);
     ht = tm.jobs.back().ht;
     std::reverse(files.begin(), files.end());
+    std::reverse(data_files.begin(), data_files.end());
     std::reverse(tm.indexes.begin(), tm.indexes.end());
     std::reverse(uuid.begin(), uuid.end());
     auto pmi = merge_memory_indexes((const IMemoryIndex **)&tm.indexes[0], tm.indexes.size());
@@ -1266,7 +1309,7 @@ static IMemoryIndex *load_merge_index(vector<IFile *> &files, vector<UUID> &uuid
     // all indexes will be deleted automatically by ptr_vector
 }
 
-IFileRO *open_files_ro(IFile **files, size_t n, bool ownership) {
+IFileRO *open_files_ro(IFile **files, size_t n, bool ownership, IFile **data_files) {
     if (n > MAX_STACK_LAYERS) {
         LOG_ERROR_RETURN(0, 0, "open too many files (` > `)", n, MAX_STACK_LAYERS);
     }
@@ -1275,14 +1318,16 @@ IFileRO *open_files_ro(IFile **files, size_t n, bool ownership) {
 
     HeaderTrailer ht;
     vector<IFile *> m_files(files, files + n);
+    vector<IFile *> m_r_files(data_files, data_files + n);
     vector<UUID> m_uuid(n);
-    auto pmi = load_merge_index(m_files, m_uuid, ht);
+    auto pmi = load_merge_index(m_files, m_uuid, ht, m_r_files);
     if (!pmi)
         return nullptr;
 
     auto rst = new LSMTReadOnlyFile;
     rst->m_index = pmi;
     rst->m_files = move(m_files);
+    rst->m_r_files = move(m_r_files);
     rst->m_uuid = move(m_uuid);
     rst->m_vsize = ht.virtual_size;
     rst->m_file_ownership = ownership;
@@ -1297,7 +1342,8 @@ IFileRO *open_files_ro(IFile **files, size_t n, bool ownership) {
 int merge_files_ro(vector<IFile *> files, const CommitArgs &args) {
     HeaderTrailer ht;
     vector<UUID> files_uuid(files.size());
-    auto pmi = unique_ptr<IMemoryIndex>(load_merge_index(files, files_uuid, ht));
+    vector<IFile*> ifs;
+    auto pmi = unique_ptr<IMemoryIndex>(load_merge_index(files, files_uuid, ht, ifs));
     if (!pmi)
         return -1;
 
@@ -1374,9 +1420,12 @@ IFileRW *stack_files(IFileRW *upper_layer, IFileRO *lower_layers, bool ownership
     rst->m_vsize = u->m_vsize;
     rst->m_file_ownership = ownership;
     rst->m_files.reserve(1 + l->m_files.size());
+    rst->m_r_files.reserve(1 + l->m_r_files.size());
     rst->m_uuid.reserve(1 + l->m_uuid.size());
     for (auto &x : l->m_files)
         rst->m_files.push_back(x);
+    for (auto &x : l->m_r_files)
+        rst->m_r_files.push_back(x);
     for (auto &x : l->m_uuid)
         rst->m_uuid.push_back(x);
     // check order of image ro layers.

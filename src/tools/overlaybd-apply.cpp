@@ -68,7 +68,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "failed to create image file\n");
         exit(-1);
     }
-    auto extfs = new_extfs(imgfile);
+    auto extfs = new_extfs(imgfile, false);
     if (!extfs) {
         fprintf(stderr, "new extfs failed, %s\n", strerror(errno));
         exit(-1);
@@ -80,7 +80,7 @@ int main(int argc, char **argv) {
     }
 
     auto tarf = open_file(input_path.c_str(), O_RDONLY, 0666);
-    auto tar = new Tar(tarf, target, 0);
+    auto tar = new Tar(tarf, target, 0, 4096, imgfile->get_base());
     if (tar->extract_all() < 0) {
         fprintf(stderr, "failed to extract\n");
         exit(-1);

@@ -81,6 +81,43 @@ IFile *ImageFile::__open_ro_file(const std::string &path) {
     return file;
 }
 
+IFile *ImageFile::__open_ro_data_file(const std::string &path) {
+    auto file = open_localfile_adaptor(path.c_str(), O_RDONLY, 0644, 0);
+    if (!file) {
+        set_failed("failed to open local data file " + path);
+        LOG_ERROR_RETURN(0, nullptr, "open(`),`:`", path, errno, strerror(errno));
+    }
+    return file;
+}
+
+IFile *ImageFile::__open_ro_data_remote(const std::string &dir, const std::string &data_digest,
+                                               const uint64_t size, int layer_index) {
+    std::string url;
+    int64_t extra_range, rand_wait;
+
+    if (conf.repoBlobUrl() == "") {
+        set_failed("empty repoBlobUrl");
+        LOG_ERROR_RETURN(0, nullptr, "empty repoBlobUrl for remote layer");
+    }
+    url = conf.repoBlobUrl();
+
+    if (url[url.length() - 1] != '/')
+        url += "/";
+    url += data_digest;
+
+    LOG_DEBUG("open file from remotefs: `", url);
+    IFile *remote_file = image_service.global_fs.remote_fs->open(url.c_str(), O_RDONLY);
+    if (!remote_file) {
+        if (errno == EPERM)
+            set_auth_failed();
+        else
+            set_failed("failed to open remote file " + url);
+        LOG_ERROR_RETURN(0, nullptr, "failed to open remote file `", url);
+    }
+
+    return remote_file;
+}
+
 IFile *ImageFile::__open_ro_remote(const std::string &dir, const std::string &digest,
                                                const uint64_t size, int layer_index) {
     std::string url;
@@ -158,6 +195,7 @@ void ImageFile::start_bk_dl_thread() {
 
 struct ParallelOpenTask {
     std::vector<IFile *> &files;
+    std::vector<IFile *> &data_files;
     int eno = 0;
     std::vector<ImageConfigNS::LayerConfig> &layers;
     int i = 0, nlayers;
@@ -175,9 +213,9 @@ struct ParallelOpenTask {
         this->eno = eno;
     }
 
-    ParallelOpenTask(std::vector<IFile *> &files, size_t nlayers,
+    ParallelOpenTask(std::vector<IFile *> &files, std::vector<IFile *> &data_files, size_t nlayers,
                      std::vector<ImageConfigNS::LayerConfig> &layers)
-        : files(files), nlayers(nlayers), layers(layers) {
+        : files(files), data_files(data_files), nlayers(nlayers), layers(layers) {
     }
 };
 
@@ -188,7 +226,7 @@ void *do_parallel_open_files(ImageFile *imgfile, ParallelOpenTask &tm) {
             // error occured from another threads.
             return nullptr;
         }
-        int ret = imgfile->open_lower_layer(tm.files[idx], tm.layers[idx], idx);
+        int ret = imgfile->open_lower_layer(tm.files[idx], tm.data_files[idx], tm.layers[idx], idx);
         if (ret < 0) {
             tm.set_error(errno);
             LOG_ERROR_RETURN(0, nullptr, "failed to open files");
@@ -197,7 +235,7 @@ void *do_parallel_open_files(ImageFile *imgfile, ParallelOpenTask &tm) {
     return nullptr;
 }
 
-int ImageFile::open_lower_layer(IFile *&file, ImageConfigNS::LayerConfig &layer,
+int ImageFile::open_lower_layer(IFile *&file, IFile *&data_file, ImageConfigNS::LayerConfig &layer,
                                 int index) {
     std::string opened;
     if (layer.file() != "") {
@@ -212,6 +250,14 @@ int ImageFile::open_lower_layer(IFile *&file, ImageConfigNS::LayerConfig &layer,
             opened = layer.digest();
             file = __open_ro_remote(layer.dir(), layer.digest(), layer.size(), index);
         }
+    }
+
+    if (layer.dataFile() != "") {
+        LOG_INFO("open local data file `", layer.dataFile());
+        data_file = __open_ro_data_file(layer.dataFile());
+    } else if (layer.dataDigest() != "") {
+        LOG_INFO("open remote data file `", layer.dataDigest());
+        data_file = __open_ro_data_remote(layer.dir(), layer.dataDigest(), 0, index);
     }
     if (file != nullptr) {
         LOG_DEBUG("layer index: `, open(`) success", index, opened);
@@ -230,11 +276,14 @@ LSMT::IFileRO *ImageFile::open_lowers(std::vector<ImageConfigNS::LayerConfig> &l
 
     photon::join_handle *ths[PARALLEL_LOAD_INDEX];
     std::vector<IFile *> files;
+    std::vector<IFile *> data_files;
     files.resize(lowers.size(), nullptr);
+    data_files.resize(lowers.size(), nullptr);
+
     auto n = std::min(PARALLEL_LOAD_INDEX, (int)lowers.size());
     LOG_DEBUG("create ` photon threads to open lowers", n);
 
-    ParallelOpenTask tm(files, lowers.size(), lowers);
+    ParallelOpenTask tm(files, data_files, lowers.size(), lowers);
     for (auto i = 0; i < n; ++i) {
         ths[i] =
             photon::thread_enable_join(photon::thread_create11(&do_parallel_open_files, this, tm));
@@ -245,7 +294,8 @@ LSMT::IFileRO *ImageFile::open_lowers(std::vector<ImageConfigNS::LayerConfig> &l
     }
 
     for (int i = 0; i < files.size(); i++) {
-        if (files[i] == NULL) {
+        if (files[i] == nullptr ||
+            ( (lowers[i].dataFile() != "" || lowers[i].dataDigest() != "") && data_files[i] == nullptr) ) {
             LOG_ERROR("layer index ` open failed, exit.", i);
             if (m_exception == "")
                 m_exception = "failed to open layer " + std::to_string(i);
@@ -253,7 +303,8 @@ LSMT::IFileRO *ImageFile::open_lowers(std::vector<ImageConfigNS::LayerConfig> &l
             goto ERROR_EXIT;
         }
     }
-    ret = LSMT::open_files_ro((IFile **)&(files[0]), lowers.size(), true);
+
+    ret = LSMT::open_files_ro((IFile **)&(files[0]), lowers.size(), true, (IFile **)&(data_files[0]));
     if (!ret) {
         LOG_ERROR("LSMT::open_files_ro(files, `, `) return NULL", lowers.size(), true);
         goto ERROR_EXIT;
