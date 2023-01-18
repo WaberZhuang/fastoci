@@ -14,24 +14,11 @@ public:
     virtual photon::fs::IFileSystem *filesystem() override {
         return nullptr;
     }
+    off_t lseek(off_t offset, int whence) override {
+        return gzseek(m_gzf, offset, whence);
+    }
     ssize_t read(void *buf, size_t count) override {
-        auto pbuf = buf;
-        size_t total = 0;
-        while (count > 0) {
-            if (m_left == 0) {
-                auto load_res = load_data();
-                if (load_res == 0) return total;
-                if (load_res < 0)  return load_res;
-            }
-            auto cnt = std::min((int)count, m_left);
-            memcpy(pbuf, m_buf + m_cur, cnt);
-            pbuf = pbuf + cnt;
-            count -= cnt;
-            m_cur += cnt;
-            m_left -= cnt;
-            total += cnt;
-        }
-        return total;
+        return gzread(m_gzf, buf, count);
     }
     int fstat(struct stat *buf) override {
         return 0;
@@ -41,12 +28,13 @@ private:
     char m_buf[1024*1024];
     int m_cur = 0, m_left = 0;
     int load_data() {
-        auto rc = gzread(m_gzf, m_buf, sizeof(m_buf));
+        auto rc = gzread(m_gzf, m_buf, 1024*1024);
         if (rc < 0) {
             LOG_ERRNO_RETURN(0, -1, "failed to gzread");
         }
         m_cur = 0;
         m_left = rc;
+        LOG_INFO(VALUE(rc));
         return rc;
     }
 };
