@@ -27,6 +27,7 @@ limitations under the License.
 #include <sys/types.h>
 #include <sys/stat.h>
 #include "index.h"
+#include "photon/fs/virtual-file.h"
 #include <photon/common/alog.h>
 #include <photon/common/utility.h>
 #include <photon/thread/thread.h>
@@ -246,26 +247,23 @@ public:
     if (!is_aligned((size) | (offset)))                                                            \
         LOG_ERROR_RETURN(EFAULT, -1, "arguments must be aligned!");
 
-    virtual ssize_t pread(void *buf, size_t count, off_t offset) override {
-        CHECK_ALIGNMENT(count, offset);
-        auto nbytes = count;
-        while (count > MAX_IO_SIZE) {
-            auto ret = pread(buf, MAX_IO_SIZE, offset);
-            if (ret < (ssize_t)MAX_IO_SIZE)
-                return -1;
-            (char *&)buf += MAX_IO_SIZE;
-            count -= MAX_IO_SIZE;
-            offset += MAX_IO_SIZE;
-        }
+    int lookup(void *buf, size_t count, off_t offset, vector<SegmentMapping> *hole) {
+        //!!!!
         count /= ALIGNMENT;
         offset /= ALIGNMENT;
         Segment s{(uint64_t)offset, (uint32_t)count};
+        off_t buf_offset = 0;
         auto ret = foreach_segments(
             m_index, s,
             [&](const Segment &m) __attribute__((always_inline)) {
                 auto step = m.length * ALIGNMENT;
-                memset(buf, 0, step);
+                if (hole != nullptr) {
+                    hole->push_back(SegmentMapping(m.offset, m.length, buf_offset));
+                } else {
+                    memset(buf, 0, step);
+                }
                 (char *&)buf += step;
+                buf_offset += m.length;
                 return 0;
             },
             [&](const SegmentMapping &m) __attribute__((always_inline)) {
@@ -284,8 +282,24 @@ public:
                 lsmt_io_size += ret;
                 lsmt_io_cnt++;
                 (char *&)buf += size;
+                buf_offset += m.length;
                 return 0;
             });
+        return ret;
+    }
+
+    virtual ssize_t pread(void *buf, size_t count, off_t offset) override {
+        CHECK_ALIGNMENT(count, offset);
+        auto nbytes = count;
+        while (count > MAX_IO_SIZE) {
+            auto ret = pread(buf, MAX_IO_SIZE, offset);
+            if (ret < (ssize_t)MAX_IO_SIZE)
+                return -1;
+            (char *&)buf += MAX_IO_SIZE;
+            count -= MAX_IO_SIZE;
+            offset += MAX_IO_SIZE;
+        }
+        auto ret = lookup(buf, count, offset, nullptr);
         return (ret >= 0) ? nbytes : ret;
     }
 
@@ -900,8 +914,8 @@ public:
         {
             ret = m_files[m_rw_tag]->pwrite(buf, count, moffset);
             if (ret != (ssize_t)count) {
-                LOG_ERRNO_RETURN(0, -1, "write failed, file:`, ret:`, pos:`, count:`", m_files[m_rw_tag],
-                                 ret, moffset, count);
+                LOG_ERRNO_RETURN(0, -1, "write failed, file:`, ret:`, pos:`, count:`",
+                                 m_files[m_rw_tag], ret, moffset, count);
             }
             LOG_DEBUG("insert segment: `", m);
             static_cast<IMemoryIndex0 *>(m_index)->insert(m);
@@ -914,7 +928,8 @@ public:
         m.moffset = (uint64_t)(m.offset + (HeaderTrailer::SPACE / ALIGNMENT));
         LOG_DEBUG(m);
         static_cast<IMemoryIndex0 *>(m_index)->insert(m);
-        return m_files[m_rw_tag]->trim(m.offset * ALIGNMENT + HeaderTrailer::SPACE, m.length * ALIGNMENT);
+        return m_files[m_rw_tag]->trim(m.offset * ALIGNMENT + HeaderTrailer::SPACE,
+                                       m.length * ALIGNMENT);
     }
 
     // sparse RW File can't support these methods:
@@ -925,10 +940,10 @@ public:
 
         auto moffset = BASE_MOFFSET;
         while (true) {
-            auto begin = const_cast<IFile*>(file)->lseek(moffset, SEEK_DATA);
+            auto begin = const_cast<IFile *>(file)->lseek(moffset, SEEK_DATA);
             if (begin == -1)
                 break;
-            auto end =  const_cast<IFile*>(file)->lseek(begin, SEEK_HOLE);
+            auto end = const_cast<IFile *>(file)->lseek(begin, SEEK_HOLE);
             if (end == -1)
                 break;
             LOG_DEBUG("segment find: [ mbegin: `, mend: ` ]", begin, end);
@@ -955,6 +970,114 @@ public:
         LOG_INFO("segment size: `", mappings.size());
         return 0;
     }
+};
+
+class LSMTWarpFile : public LSMTFile {
+public:
+    ssize_t pwrite(const void *buf, size_t count, off_t offset, WarpSegment::SegmentType tag) {
+
+        auto moffset = offset;
+        SegmentMapping m{
+            (uint64_t)offset / (uint64_t)ALIGNMENT,
+            (uint32_t)count / (uint32_t)ALIGNMENT,
+            (uint64_t)moffset / (uint64_t)ALIGNMENT,
+        };
+        if (tag == WarpSegment::SegmentType::remoteData) {
+            m.moffset = ((RemoteLBA *)buf)->roffset / (uint64_t)ALIGNMENT;
+        }
+        ssize_t ret = -1;
+        {
+            ret = m_files[(uint8_t)tag]->pwrite(buf, count, offset);
+            if (ret != (ssize_t)count) {
+                LOG_ERRNO_RETURN(0, -1, "write failed, file:`, ret:`, pos:`, count:`",
+                                 m_files[(uint8_t)tag], ret, moffset, count);
+            }
+            LOG_DEBUG("insert segment: `", m);
+            static_cast<IMemoryIndex0 *>(m_index)->insert(m);
+        }
+        return ret;
+    }
+
+    virtual ssize_t pwrite(const void *buf, size_t count, off_t offset) override {
+        LOG_DEBUG("write fs meta {offset: `, len: `}", offset, count);
+        auto ret = pwrite(buf, count, offset, WarpSegment::SegmentType::fsMeta);
+        if (ret != (ssize_t)count) {
+            LOG_ERRNO_RETURN(0, -1, "pwrite fsmeta failed.");
+        }
+        return count;
+    }
+
+    virtual int vioctl(int request, va_list args) override {
+        if (request != RemoteData)
+            LOG_ERROR_RETURN(EINVAL, -1, "invaid request code");
+
+        va_list tmp;
+        va_copy(tmp, args);
+        auto lba = va_arg(tmp, RemoteLBA);
+        va_end(tmp);
+        // LOG_DEBUG("remoteLBA: {offset: `, count: `, roffset: `}",
+        //     lba.offset, lba.count, lba.roffset);
+        auto ret = pwrite(&lba, lba.count, lba.offset, WarpSegment::SegmentType::remoteData);
+        if (ret != (ssize_t)sizeof(lba)) {
+            LOG_ERRNO_RETURN(0, -1, "pwrite fsmeta failed.");
+        }
+        return 0;
+    }
+
+    class RemoteFile : public VirtualReadOnlyFile {
+    public:
+        IFile *m_lba_file = nullptr;
+        IFile *m_remote_file = nullptr;
+        RemoteFile(IFile *lba_file, IFile *remote_file)
+            : m_lba_file(lba_file), m_remote_file(remote_file) {
+        }
+
+        virtual ssize_t pwrite(const void *buf, size_t count, off_t offset) override {
+            auto lba = *(RemoteLBA *)buf;
+            LOG_DEBUG("write remoteLBA {offset: `, len: `, roffset}", lba.offset, lba.count,
+                      lba.roffset);
+            auto ret = m_lba_file->pwrite(buf, sizeof(lba), offset);
+            if (ret != (ssize_t)count) {
+                LOG_ERRNO_RETURN(0, -1, "pwrite fsmeta failed.");
+            }
+            return count;
+        }
+        virtual ssize_t pread(void *buf, size_t count, off_t offset) override {
+            return m_remote_file->pread(buf, count, offset);
+        }
+    };
+
+    // int gather_data(CompactOptions &opts, uint8_t tag) {
+
+    //     auto file = opts.commit_args->as;
+    //     for (off_t i = 0; i < opts.index_size; i++) {
+    //         auto m = opts.raw_index + i;
+    //         if (m->tag != tag) continue;
+    //         auto ret = file->write(m, sizeof(*m));
+    //         if (ret != sizeof(*m)) {
+    //             LOG_ERRNO_RETURN(0, -1, "write data failed.");
+    //         }
+    //     }
+    // }
+
+    // int commit(const CommitArgs &args) const override {
+
+    //     auto m_index0 = (IMemoryIndex0 *)m_index;
+    //     unique_ptr<SegmentMapping[]> mapping(m_index0->dump());
+
+    //     CompactOptions opts;
+    //     opts.src_files = (IFile **)&m_files[0];
+    //     opts.n = m_files.size();
+    //     opts.raw_index = mapping.get();
+    //     opts.index_size = m_index->size();
+    //     opts.virtual_size = m_vsize;
+    //     opts.commit_args = &args;
+    //     // atomic_uint64_t _no_use_var(0);
+    //     // return compact(opts, _no_use_var);
+    //     // write_header_trailer(fdata, true, false, true, 0, 0, args);
+    //     gather_data(opts, WarpSegment::SegmentType::fsMeta);
+       
+    // }
 };
 
 HeaderTrailer *verify_ht(IFile *file, char *buf) {
@@ -1161,6 +1284,32 @@ IFileRW *create_file_rw(const LayerInfo &args, bool ownership) {
         fdata->ftruncate(args.virtual_size + HeaderTrailer::SPACE);
     }
     return rst;
+}
+
+IFileRW *create_warpfile(FastImageArgs &args, bool ownership) {
+    auto rst = new LSMTWarpFile;
+    rst->m_findex = args.findex;
+    rst->m_index = create_memory_index0((const SegmentMapping *)nullptr, 0, 0, 0);
+    rst->m_files.resize(2);
+    rst->m_files[(uint8_t)WarpSegment::SegmentType::fsMeta] = args.fmeta;
+    rst->m_files[(uint8_t)WarpSegment::SegmentType::remoteData] = args.fdata;
+    rst->m_vsize = args.virtual_size;
+    rst->m_file_ownership = ownership;
+    UUID raw;
+    raw.parse(args.uuid);
+    rst->m_uuid.push_back(raw);
+    HeaderTrailer tmp;
+    tmp.version = 2;
+    tmp.sub_version = 0;
+    args.fdata->ftruncate(args.virtual_size);
+    args.fmeta->ftruncate(args.virtual_size);
+
+    LOG_INFO("WarpImage Layer: { UUID:`, Parent_UUID: `, Sparse: ` Virtual size: `, Version: `.` }",
+             raw, args.parent_uuid, args.sparse_rw, rst->m_vsize, tmp.version, tmp.sub_version);
+    return rst;
+}
+
+IFileRO *open_warpfile(IFile *warpfile, IFile *remote_file, bool ownership) {
 }
 
 struct parallel_load_task {

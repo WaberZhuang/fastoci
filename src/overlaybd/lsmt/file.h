@@ -67,6 +67,9 @@ public:
     virtual IMemoryIndex0 *index() const override = 0;
 
     const int Index_Group_Commit = 10;
+
+    const int RemoteData = 11;
+
     int set_index_group_commit(size_t buffer_size) {
         return this->ioctl(Index_Group_Commit, buffer_size);
     }
@@ -105,6 +108,24 @@ struct LayerInfo {
         uuid.generate();
     }
 };
+
+struct FastImageArgs {
+    IFile *fmeta = nullptr; // sparse_file
+    IFile *fdata = nullptr;  // sparse_file
+    IFile *findex = nullptr;
+    uint64_t virtual_size;
+    UUID parent_uuid;
+    UUID uuid;
+    char *user_tag = nullptr; // a user provided string of message, 256B at most
+    bool sparse_rw = false;
+    size_t len = 0;           // len of user_tag; if it's 0, it will be detected with strlen()
+    FastImageArgs(IFile *_fmeta = nullptr, IFile *_fdata = nullptr, IFile *_findex = nullptr) 
+        : fmeta(_fmeta), fdata(_fdata), findex(_findex) {
+        parent_uuid.clear();
+        uuid.generate();
+    }
+};
+
 extern "C" IFileRW *create_file_rw(const LayerInfo &args, bool ownership = false);
 
 // open a writable LSMT file constitued by a data file and a index file,
@@ -123,6 +144,8 @@ extern "C" IFileRO *open_file_ro(IFile *file, bool ownership = false);
 // optionally obtaining the ownerships of the underlying files,
 // thus they will be destructed automatically.
 extern "C" IFileRO *open_files_ro(IFile **files, size_t n, bool ownership = false);
+
+extern "C" IFileRW *create_warp_file(FastImageArgs &args, bool ownership);
 
 // merge multiple RO files (layers) into a single RO file (layer)
 // returning 0 for success, -1 otherwise

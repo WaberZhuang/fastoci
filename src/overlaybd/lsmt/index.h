@@ -26,6 +26,7 @@ IMemoryIndex -> IMemoryIndex0 -> IComboIndex -> Index0 ( set<SegmentMap> ) -> Co
 #include <inttypes.h>
 #include <cstddef>
 #include <assert.h>
+#include <sys/types.h>
 
 namespace LSMT {
 struct Segment {          // 48 + 18 == 64
@@ -81,6 +82,60 @@ struct SegmentMapping : public Segment { // 64 + 55 + 9 == 128
     static SegmentMapping invalid_mapping() {
         return SegmentMapping(INVALID_OFFSET, 0, 0);
     }
+} __attribute__((packed));
+
+struct RemoteLBA {
+    off_t offset;
+    uint32_t count;
+    off_t roffset; 
+};
+
+struct WarpSegment : public LSMT::Segment {
+
+    // uint16_t fd_entry = sizeof(WarpSegment);
+    // uint16_t fn_size : 12; // 4K for blobURL is totally enough
+    // uint8_t tag : 4;       // fsmeta or remteURL ?
+    // uint64_t roffset;         // offset in remote file
+    // char fn[0];
+
+    enum class SegmentType {
+        fsMeta,
+        remoteData,
+    };
+
+    // // mark segment as a remote data
+    // void set_tag_data() {
+    //     tag = (uint8_t)SegmentType::remoteData;
+    // }
+    // // mark segment as a fs meta
+    // void set_tag_fsmeta() {
+    //     tag = (uint8_t)SegmentType::fsMeta;
+    // }
+
+    // static const size_t HEAD_SIZE = sizeof(UUID) + sizeof(uint64_t);
+
+    // WarpSegment(const char *buf, size_t count, off_t offset, SegmentType type) {
+    //     this->offset = offset;
+    //     this->length = count;
+    //     roffset = *(off_t *)(&buf[0]);
+    //     // auto path = std::string(buf + sizeof(roffset));
+    //     fn_size = 0;
+    //     tag = (uint8_t)type;
+    // }
+
+    // void forward_offset_to(uint64_t x) {
+    //     auto delta = LSMT::Segment::forward_offset_to(x);
+    //     roffset += delta;
+    // }
+
+    // std::string_view file_name() const {
+    //     return {(char *)this + fd_entry, fn_size};
+    // }
+
+    // inline std::string_view buffer() const {
+    //     return file_name();
+    // }
+
 } __attribute__((packed));
 
 // a read-only memory index for log-structured data

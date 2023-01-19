@@ -23,6 +23,8 @@ IMemoryIndex -> IMemoryIndex0 -> IComboIndex -> Index0 ( set<SegmentMap> ) -> Co
 
 */
 #include "lsmt-filetest.h"
+#include "photon/fs/localfs.h"
+#include <fcntl.h>
 #include <sys/time.h>
 #include <photon/photon.h>
 
@@ -723,6 +725,29 @@ TEST_F(FileTest3, photon_verify) {
     }
     for (auto thd : threads)
         thread_join((photon::join_handle *)thd);
+}
+
+void genTestFile() {
+
+    char buf[1<<20]{};
+    char c = '0' - 1;
+    IFile *testfile = open_localfile_adaptor("/tmp/warpfile", O_TRUNC|O_CREAT|O_RDWR);
+    for (off_t i = 0; i < 16; i++) {
+        c++;
+        memset(buf, c, sizeof(buf));
+        testfile->write(buf, sizeof(buf));
+        if (i == 9) {
+            c = 'A';
+        }
+    }
+    testfile->close();
+}
+
+
+TEST_F(FileTest3, warpfile) {
+    CleanUp();
+    genTestFile();
+    // delete file;
 }
 
 int main(int argc, char **argv) {
