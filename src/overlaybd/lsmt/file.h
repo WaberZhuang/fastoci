@@ -68,7 +68,7 @@ public:
 
     const int Index_Group_Commit = 10;
 
-    const int RemoteData = 11;
+    static const int RemoteData = 11;
 
     int set_index_group_commit(size_t buffer_size) {
         return this->ioctl(Index_Group_Commit, buffer_size);
@@ -145,7 +145,8 @@ extern "C" IFileRO *open_file_ro(IFile *file, bool ownership = false);
 // thus they will be destructed automatically.
 extern "C" IFileRO *open_files_ro(IFile **files, size_t n, bool ownership = false);
 
-extern "C" IFileRW *create_warp_file(FastImageArgs &args, bool ownership);
+extern "C" IFileRW *create_warpfile(FastImageArgs &args, bool ownership);
+
 
 // merge multiple RO files (layers) into a single RO file (layer)
 // returning 0 for success, -1 otherwise

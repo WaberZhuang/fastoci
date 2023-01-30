@@ -27,6 +27,9 @@ IMemoryIndex -> IMemoryIndex0 -> IComboIndex -> Index0 ( set<SegmentMap> ) -> Co
 #include <fcntl.h>
 #include <sys/time.h>
 #include <photon/photon.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #define USE_PTH true // use pthread
 
@@ -727,7 +730,7 @@ TEST_F(FileTest3, photon_verify) {
         thread_join((photon::join_handle *)thd);
 }
 
-void genTestFile() {
+IFile* genTestFile() {
 
     char buf[1<<20]{};
     char c = '0' - 1;
@@ -740,14 +743,63 @@ void genTestFile() {
             c = 'A';
         }
     }
-    testfile->close();
+    return testfile;
 }
 
+void FileTest3::randwrite_warpfile(IFile* file, size_t nwrites) {
+    LOG_INFO("start randwrite ` times", nwrites);
+    ALIGNED_MEM4K(buf, 1 << 20)
+    auto vsize = FLAGS_vsize<<20;
+    for (size_t i = 0; i < nwrites; ++i) {
+        off_t offset = DO_ALIGN(rand() % vsize);
+        off_t length = DO_ALIGN(rand() % (128 * 1024));
+        if ((uint64_t)(offset + length) > vsize)
+            length = DO_ALIGN(vsize - offset);
+        if (length == 0) {
+            offset -= ALIGNMENT;
+            length = ALIGNMENT;
+            continue;
+        }
+        memset(buf, 0, length);
+        auto roll = rand() % 4;
+        LOG_DEBUG("offset: `, length: `", offset, length);
+
+        if (roll == 0) {
+            for (auto j = 0; j < length; j++) {
+                auto k = rand() % 256;
+                buf[j] = k; // j  & 0xff;
+            }
+            ssize_t ret = file->pwrite(buf, length, offset);
+            if (ret != length) {
+                LOG_ERROR("`(`)", errno, strerror(errno));
+                exit(-1);
+            }
+            EXPECT_EQ(ret, length);
+        } else {
+            RemoteLBA lba;
+            lba.count = length;
+            lba.offset = offset;
+            lba.roffset = offset;
+            file->ioctl(IFileRW::RemoteData, lba);
+        }
+        if (FLAGS_verify) {
+            memcpy(data + offset, buf, length);
+        }
+    }
+}
 
 TEST_F(FileTest3, warpfile) {
     CleanUp();
-    genTestFile();
-    // delete file;
+    log_output_level = FLAGS_log_level;
+    LOG_INFO("log level: `", log_output_level);
+    auto fdata = open_localfile_adaptor("/tmp/warpfile.data",O_TRUNC|O_CREAT|O_RDWR);
+    auto fmeta = open_localfile_adaptor("/tmp/warpfile.meta",O_TRUNC|O_CREAT|O_RDWR);
+    FastImageArgs args(fmeta, fdata, nullptr);
+    args.virtual_size = FLAGS_vsize << 20;
+    auto file = create_warpfile(args, true);
+    DEFER(delete file);
+    randwrite_warpfile(file, FLAGS_nwrites);
+    verify_file(file);
 }
 
 int main(int argc, char **argv) {
@@ -759,6 +811,7 @@ int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
     ::gflags::ParseCommandLineFlags(&argc, &argv, true);
     log_output_level = FLAGS_log_level;
+    LOG_INFO("log level: `", log_output_level);
     photon::init(photon::INIT_EVENT_DEFAULT, photon::INIT_IO_DEFAULT);
 
     auto ret = RUN_ALL_TESTS();

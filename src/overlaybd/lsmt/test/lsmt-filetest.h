@@ -562,4 +562,6 @@ public:
         if (lfs->access(fn_merged, 0) == 0)
             lfs->unlink(fn_merged);
     }
+    
+    void randwrite_warpfile(IFile* file, size_t nwrites);
 };

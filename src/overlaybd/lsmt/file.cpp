@@ -986,15 +986,14 @@ public:
             m.moffset = ((RemoteLBA *)buf)->roffset / (uint64_t)ALIGNMENT;
         }
         ssize_t ret = -1;
-        {
-            ret = m_files[(uint8_t)tag]->pwrite(buf, count, offset);
-            if (ret != (ssize_t)count) {
-                LOG_ERRNO_RETURN(0, -1, "write failed, file:`, ret:`, pos:`, count:`",
-                                 m_files[(uint8_t)tag], ret, moffset, count);
-            }
-            LOG_DEBUG("insert segment: `", m);
-            static_cast<IMemoryIndex0 *>(m_index)->insert(m);
+        auto file =  m_files[(uint8_t)tag];
+        ret = file->pwrite(buf, count, offset);
+        LOG_DEBUG("insert segment: `, filePtr: `", m, file);
+        if (ret != (ssize_t)count) {
+            LOG_ERRNO_RETURN(0, -1, "write failed, file:`, ret:`, pos:`, count:`",
+                                file, ret, moffset, count);
         }
+        static_cast<IMemoryIndex0 *>(m_index)->insert(m);
         return ret;
     }
 
