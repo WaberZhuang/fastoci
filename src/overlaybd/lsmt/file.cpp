@@ -27,6 +27,7 @@ limitations under the License.
 #include <sys/types.h>
 #include <sys/stat.h>
 #include "index.h"
+#include "photon/fs/filesystem.h"
 #include "photon/fs/virtual-file.h"
 #include <photon/common/alog.h>
 #include <photon/common/utility.h>
@@ -1014,8 +1015,8 @@ public:
         va_copy(tmp, args);
         auto lba = va_arg(tmp, RemoteLBA);
         va_end(tmp);
-        // LOG_DEBUG("remoteLBA: {offset: `, count: `, roffset: `}",
-        //     lba.offset, lba.count, lba.roffset);
+        LOG_DEBUG("remoteLBA: {offset: `, count: `, roffset: `}",
+            lba.offset, lba.count, lba.roffset);
         auto ret = pwrite(&lba, lba.count, lba.offset, WarpSegment::SegmentType::remoteData);
         if (ret != (ssize_t)sizeof(lba)) {
             LOG_ERRNO_RETURN(0, -1, "pwrite fsmeta failed.");
@@ -1041,9 +1042,16 @@ public:
             }
             return count;
         }
+
         virtual ssize_t pread(void *buf, size_t count, off_t offset) override {
             return m_remote_file->pread(buf, count, offset);
         }
+
+        virtual int fstat(struct stat *buf) override {
+            return m_remote_file->fstat(buf);
+        }
+        
+        UNIMPLEMENTED_POINTER(IFileSystem *filesystem() override);
     };
 
     // int gather_data(CompactOptions &opts, uint8_t tag) {
@@ -1287,11 +1295,11 @@ IFileRW *create_file_rw(const LayerInfo &args, bool ownership) {
 
 IFileRW *create_warpfile(FastImageArgs &args, bool ownership) {
     auto rst = new LSMTWarpFile;
-    rst->m_findex = args.findex;
+    rst->m_findex = nullptr;
     rst->m_index = create_memory_index0((const SegmentMapping *)nullptr, 0, 0, 0);
     rst->m_files.resize(2);
     rst->m_files[(uint8_t)WarpSegment::SegmentType::fsMeta] = args.fmeta;
-    rst->m_files[(uint8_t)WarpSegment::SegmentType::remoteData] = args.fdata;
+    rst->m_files[(uint8_t)WarpSegment::SegmentType::remoteData] = new LSMT::LSMTWarpFile::RemoteFile(args.findex, args.fdata);
     rst->m_vsize = args.virtual_size;
     rst->m_file_ownership = ownership;
     UUID raw;

@@ -783,7 +783,8 @@ void FileTest3::randwrite_warpfile(IFile* file, size_t nwrites) {
             file->ioctl(IFileRW::RemoteData, lba);
         }
         if (FLAGS_verify) {
-            memcpy(data + offset, buf, length);
+            // memcpy(data + offset, buf, length);
+            fcheck->pwrite(buf, length, offset);
         }
     }
 }
@@ -796,6 +797,7 @@ TEST_F(FileTest3, warpfile) {
     auto fmeta = open_localfile_adaptor("/tmp/warpfile.meta",O_TRUNC|O_CREAT|O_RDWR);
     FastImageArgs args(fmeta, fdata, nullptr);
     args.virtual_size = FLAGS_vsize << 20;
+    // Set memory file
     auto file = create_warpfile(args, true);
     DEFER(delete file);
     randwrite_warpfile(file, FLAGS_nwrites);

@@ -178,8 +178,8 @@ public:
 class FileTest2 : public FileTest {
 public:
     const char *fn_verify = "verify.img";
-    IFile *fimg = nullptr;
-    char *data = nullptr;
+    IFile *fcheck = nullptr;
+    // char *data = nullptr;
     photon::mutex mtx;
     vector<size_t> clayer_size{};
 
@@ -228,7 +228,12 @@ public:
                 file->fallocate(3, offset, length);
             }
             if (FLAGS_verify) {
-                memcpy(data + offset, buf, length);
+                // memcpy(data + offset, buf, length);
+                if (roll == 0) {
+                    fcheck->fallocate(3, offset, length);
+                } else {
+                    fcheck->pwrite(buf, offset, length);
+                }
             }
         }
         gettimeofday(&end_time, 0);
@@ -287,7 +292,7 @@ public:
                 EXPECT_EQ(ret, length);
             }
             if (FLAGS_verify) {
-                memcpy(data + offset, buf, length);
+                fcheck->pwrite(buf, offset, length);
             }
         }
         gettimeofday(&end_time, 0);
@@ -297,38 +302,42 @@ public:
     }
 
     void reset_verify_file() {
+        if (fcheck) {
+            delete fcheck;
+        }
         LOG_INFO("create verify image.");
         auto fn_verify_path = string("/tmp/") + fn_verify;
-        int fd = ::open(fn_verify_path.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0644);
-        if (fd == -1) {
+        fcheck = open_localfile_adaptor(fn_verify_path.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0644);
+        if (fcheck == nullptr) {
             LOG_ERROR("create ` failed.", fn_verify_path.c_str());
             return;
         }
         LOG_INFO("fallocate ` MB size.", vsize >> 20);
-        if (posix_fallocate(fd, 0, vsize) == -1) {
-            LOG_ERROR("err: `(`)", errno, strerror(errno));
+        if (fcheck->fallocate(0, 0, vsize) != 0) {
+            LOG_ERROR("fallocate verify file failed.");
             return;
         }
+        
         struct stat st;
-        fstat(fd, &st);
+        fcheck->fstat(&st);
         EXPECT_EQ((uint64_t)st.st_size, vsize);
-        if (vsize > 512 << 20) {
-            LOG_INFO("do mmap...");
-            data = (char *)mmap(nullptr, vsize, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
-            if (data == MAP_FAILED) {
-                LOG_ERROR("err: `(`)", errno, strerror(errno));
-                return;
-            }
-        } else {
-            data = new char[vsize]{};
-        }
-        ::close(fd);
-        memset(data, 0, vsize);
+        // if (vsize > 512 << 20) {
+        //     LOG_INFO("do mmap...");
+        //     data = (char *)mmap(nullptr, vsize, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+        //     if (data == MAP_FAILED) {
+        //         LOG_ERROR("err: `(`)", errno, strerror(errno));
+        //         return;
+        //     }
+        // } else {
+        //     data = new char[vsize]{};
+        // }
+        // ::close(fd);
+        // memset(data, 0, vsize);
     }
 
     IFileRW *create_file(bool sparse = false) {
         cout << "creating a file, by randwrite()" << endl;
-        memset(data, 0, PREAD_LEN);
+        // memset(data, 0, PREAD_LEN);
         cout << "create_file_rw" << endl;
         auto file = create_file_rw(sparse);
         cout << "randwrite" << endl;
@@ -346,6 +355,7 @@ public:
         EXPECT_EQ(file->lseek(0, SEEK_END), (off_t)vsize);
         ALIGNED_MEM4K(buf, 1 << 20)
         auto buf_len = PREAD_LEN;
+        char v[PREAD_LEN]{};
         for (off_t o = 0; o < (off_t)vsize; o += buf_len) {
             auto ret = file->pread(buf, buf_len, o);
             EXPECT_EQ(ret, (ssize_t)buf_len);
@@ -355,7 +365,8 @@ public:
             }
             if (!FLAGS_verify)
                 continue;
-            char *v = (data + o);
+            auto ret_v = fcheck->pread(v, buf_len, o);
+            EXPECT_EQ(ret, ret_v);
             for (auto i = 0; i < buf_len; i++) {
                 EXPECT_EQ(buf[i], v[i]);
                 if (buf[i] != v[i]) {
@@ -553,7 +564,7 @@ public:
 
     virtual void TearDown() override {
         if (FLAGS_verify) {
-            munmap(data, vsize);
+            delete fcheck;
         }
         return;
         printf("Tear Down....\n");
