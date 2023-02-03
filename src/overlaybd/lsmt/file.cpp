@@ -1015,21 +1015,37 @@ public:
             (uint32_t)count / (uint32_t)ALIGNMENT,
             (uint64_t)moffset / (uint64_t)ALIGNMENT,
         };
+        auto append = [&](const void *buf, SegmentMapping m)->ssize_t{
+            ssize_t ret = -1;
+            m.tag = (uint8_t)tag;
+            auto file = m_files[(uint8_t)tag];
+            ret = file->pwrite(buf, count, offset);
+            LOG_DEBUG("insert segment: `, filePtr: `", m, file);
+            if (ret != (ssize_t)count) {
+                LOG_ERRNO_RETURN(0, -1, "write failed, file:`, ret:`, pos:`, count:`", file, ret,
+                                moffset, count);
+            }
+            static_cast<IMemoryIndex0 *>(m_index)->insert(m);
+            return ret;
+        };
         if (tag == WarpSegment::SegmentType::remoteData) {
             m.moffset = ((RemoteLBA *)buf)->roffset / (uint64_t)ALIGNMENT;
-            m.length = ((RemoteLBA *)buf)->count / (uint64_t)ALIGNMENT;
+            auto limit_len = Segment::MAX_LENGTH;
+            size_t nwrite = 0;
+            size_t count = ((RemoteLBA *)buf)->count / (uint64_t)ALIGNMENT;
+            RemoteLBA lba = *(RemoteLBA *)buf;
+            while (count > 0) {
+                m.length = (limit_len < count ? limit_len : count);
+                lba.count = m.length * ALIGNMENT;
+                nwrite += append(&lba, m);
+                count -= m.length;
+                lba.offset += m.length * ALIGNMENT;
+                lba.roffset += m.length * ALIGNMENT;
+                m.forward_offset_to(m.offset + m.length);
+            }
+            return nwrite;
         }
-        ssize_t ret = -1;
-        m.tag = (uint8_t)tag;
-        auto file = m_files[(uint8_t)tag];
-        ret = file->pwrite(buf, count, offset);
-        LOG_DEBUG("insert segment: `, filePtr: `", m, file);
-        if (ret != (ssize_t)count) {
-            LOG_ERRNO_RETURN(0, -1, "write failed, file:`, ret:`, pos:`, count:`", file, ret,
-                             moffset, count);
-        }
-        static_cast<IMemoryIndex0 *>(m_index)->insert(m);
-        return ret;
+        return append(buf, m);
     }
 
     virtual ssize_t pwrite(const void *buf, size_t count, off_t offset) override {
@@ -1056,7 +1072,7 @@ public:
                   lba.roffset);
         auto ret =
             pwrite(&lba, (ssize_t)sizeof(lba), lba.offset, WarpSegment::SegmentType::remoteData);
-        if (ret != (ssize_t)sizeof(lba)) {
+        if (ret != ((lba.count / ALIGNMENT - 1) / Segment::MAX_LENGTH + 1) * sizeof(RemoteLBA)) {
             LOG_ERRNO_RETURN(0, -1, "pwrite fsmeta failed.");
         }
         return 0;

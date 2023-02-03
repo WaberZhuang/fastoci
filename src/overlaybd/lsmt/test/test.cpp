@@ -30,6 +30,7 @@ IMemoryIndex -> IMemoryIndex0 -> IComboIndex -> Index0 ( set<SegmentMap> ) -> Co
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <string.h>
 
 #define USE_PTH true // use pthread
 
@@ -794,6 +795,34 @@ TEST_F(WarpFile, randwrite) {
     fcommit->fstat(&st1);
     LOG_INFO("comparison of rawfile & warpfile: `, `", st0.st_size, st1.st_size);    
     fcheck = nullptr; // delete by warpfile.
+}
+
+
+TEST_F(WarpFile, large_lba) {
+    CleanUp();
+    log_output_level = FLAGS_log_level;
+    LOG_INFO("log level: `", log_output_level);
+    auto flba = open_localfile_adaptor("/tmp/warpfile.lba",O_TRUNC|O_CREAT|O_RDWR);
+    auto fmeta = open_localfile_adaptor("/tmp/warpfile.meta",O_TRUNC|O_CREAT|O_RDWR);
+    FastImageArgs args(fmeta, fcheck, flba);
+    args.virtual_size = FLAGS_vsize << 20;
+    // Set memory file
+    auto file = create_warpfile(args, true);
+    DEFER(delete file);
+    RemoteLBA lba;
+    lba.count = 26<<20; // 26MB
+    lba.offset = 0;
+    lba.roffset = 0;
+    file->ioctl(IFileRW::RemoteData, lba);
+    EXPECT_EQ(((LSMTWarpFile*)file)->m_index->size(), 4);
+    uint32_t LEN = Segment::MAX_LENGTH;
+    const static SegmentMapping check[] = {{0, LEN, 0, 1}, {LEN, LEN, LEN, 1}, 
+        {LEN * 2, LEN, LEN * 2, 1}, {LEN * 3, lba.count / ALIGNMENT - LEN * 3, LEN * 3, 1} };
+    auto p = ((IMemoryIndex0*)(((LSMTWarpFile*)file)->m_index))->dump();
+    for (int i = 0; i < 4; i++) {
+        LOG_INFO("check: `, mapping: `", check[i], p[i]);
+    }
+    EXPECT_EQ(memcmp((void*)check, (void*)p, 4 * sizeof(SegmentMapping)), 0);
 }
 
 int main(int argc, char **argv) {
