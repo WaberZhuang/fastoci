@@ -702,14 +702,7 @@ TEST_F(FileTest3, photon_verify) {
     randwrite(flsmt.get(), FLAGS_nwrites);
     vector<photon::thread *> threads;
     errno = 0;
-    // race in concurrency write
-    // for (int i = 0; i < thread_cnt; i++) {
-    //     threads.push_back(photon::thread_create11(&FileTest2::randwrite, (FileTest2 *)this,
-    //                                               flsmt.get(), FLAGS_nwrites / thread_cnt));
-    //     photon::thread_enable_join(threads.back());
-    // }
-    // for (auto thd : threads)
-    //     thread_join((photon::join_handle *)thd);
+   
     if (errno != 0) {
         LOG_INFO("previous err: `(`)", errno, strerror(errno));
     }
@@ -746,29 +739,17 @@ IFile* genTestFile() {
     return testfile;
 }
 
-void FileTest3::randwrite_warpfile(IFile* file, size_t nwrites) {
+void WarpFile::randwrite_warpfile(IFile* file, size_t nwrites) {
     LOG_INFO("start randwrite ` times", nwrites);
     ALIGNED_MEM4K(buf, 1 << 20)
     auto vsize = FLAGS_vsize<<20;
     for (size_t i = 0; i < nwrites; ++i) {
-        off_t offset = DO_ALIGN(rand() % vsize);
-        off_t length = DO_ALIGN(rand() % (128 * 1024));
-        if ((uint64_t)(offset + length) > vsize)
-            length = DO_ALIGN(vsize - offset);
-        if (length == 0) {
-            offset -= ALIGNMENT;
-            length = ALIGNMENT;
-            continue;
-        }
-        memset(buf, 0, length);
+        off_t offset = 0;
+        off_t length = gen_write_data(buf, vsize, 128 * 1024, offset);
         auto roll = rand() % 4;
-        LOG_DEBUG("offset: `, length: `", offset, length);
-
         if (roll == 0) {
-            for (auto j = 0; j < length; j++) {
-                auto k = rand() % 256;
-                buf[j] = k; // j  & 0xff;
-            }
+            LOG_DEBUG("offset: `, length: `", offset, length);
+
             ssize_t ret = file->pwrite(buf, length, offset);
             if (ret != length) {
                 LOG_ERROR("`(`)", errno, strerror(errno));
@@ -789,19 +770,30 @@ void FileTest3::randwrite_warpfile(IFile* file, size_t nwrites) {
     }
 }
 
-TEST_F(FileTest3, warpfile) {
+TEST_F(WarpFile, randwrite) {
     CleanUp();
     log_output_level = FLAGS_log_level;
     LOG_INFO("log level: `", log_output_level);
-    auto fdata = open_localfile_adaptor("/tmp/warpfile.data",O_TRUNC|O_CREAT|O_RDWR);
+    auto flba = open_localfile_adaptor("/tmp/warpfile.lba",O_TRUNC|O_CREAT|O_RDWR);
     auto fmeta = open_localfile_adaptor("/tmp/warpfile.meta",O_TRUNC|O_CREAT|O_RDWR);
-    FastImageArgs args(fmeta, fdata, nullptr);
+    FastImageArgs args(fmeta, fcheck, flba);
     args.virtual_size = FLAGS_vsize << 20;
     // Set memory file
     auto file = create_warpfile(args, true);
     DEFER(delete file);
     randwrite_warpfile(file, FLAGS_nwrites);
     verify_file(file);
+    LOG_INFO("commit warpfile..");
+    auto fcommit =  open_localfile_adaptor("/tmp/warpfile.commit",O_TRUNC|O_CREAT|O_RDWR);
+    CommitArgs c(fcommit);
+    file->commit(c);
+    file = (IFileRW*)open_warpfile_ro(fcommit, fcheck, true);
+    verify_file(file);
+    struct stat st0, st1;
+    fcheck->fstat(&st0);
+    fcommit->fstat(&st1);
+    LOG_INFO("comparison of rawfile & warpfile: `, `", st0.st_size, st1.st_size);    
+    fcheck = nullptr; // delete by warpfile.
 }
 
 int main(int argc, char **argv) {

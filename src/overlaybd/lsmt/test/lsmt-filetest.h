@@ -184,6 +184,25 @@ public:
     vector<size_t> clayer_size{};
 
 #define DO_ALIGN(x) ((x) / ALIGNMENT * ALIGNMENT)
+
+    size_t gen_write_data(char* buf, size_t vsize, size_t len, off_t &offset) {
+        offset = DO_ALIGN(rand() % vsize);
+        off_t length = DO_ALIGN(rand() % len);
+        if ((uint64_t)(offset + length) > vsize)
+            length = DO_ALIGN(vsize - offset);
+        if (length == 0) {
+            offset -= ALIGNMENT;
+            length = ALIGNMENT;
+            // return 0;
+        }
+        memset(buf, 0, length);
+        for (auto j = 0; j < length; j++) {
+            auto k = rand() % 256;
+            buf[j] = k; // j  & 0xff;
+        }
+        return length;
+    }
+
     void randwrite(LSMT::IFileRW *file, size_t nwrites) {
         timeval start_time, end_time;
         gettimeofday(&start_time, 0);
@@ -191,23 +210,17 @@ public:
         ALIGNED_MEM4K(buf, 1 << 20)
         struct iovec iov[8]{};
         for (size_t i = 0; i < nwrites; ++i) {
-            off_t offset = DO_ALIGN(rand() % vsize);
-            off_t length = DO_ALIGN(rand() % (128 * 1024));
-            if ((uint64_t)(offset + length) > vsize)
-                length = DO_ALIGN(vsize - offset);
-            if (length == 0) {
-                offset -= ALIGNMENT;
-                length = ALIGNMENT;
-                continue;
-            }
-            memset(buf, 0, length);
+            off_t offset = 0;
+            off_t length =  gen_write_data(buf, vsize, (128 * 1024), offset);
+            
             auto roll = rand() % 4;
             if (roll != 0) {
-                for (auto j = 0; j < length; j++) {
-                    auto k = rand() % 256;
-                    buf[j] = k; // j  & 0xff;
-                }
                 LOG_DEBUG("offset: `, length: `", offset, length);
+                if (FLAGS_verify) {
+                // memcpy(data + offset, buf, length);
+                    fcheck->pwrite(buf, length, offset);
+                }
+
                 auto slice_count = rand() % 4 + 1;
                 vector<int> seg_offset{0};
                 for (int i = 0; i < slice_count - 1; i++) {
@@ -226,15 +239,12 @@ public:
                 EXPECT_EQ(ret, length);
             } else {
                 file->fallocate(3, offset, length);
-            }
-            if (FLAGS_verify) {
+                if (FLAGS_verify) {
                 // memcpy(data + offset, buf, length);
-                if (roll == 0) {
                     fcheck->fallocate(3, offset, length);
-                } else {
-                    fcheck->pwrite(buf, offset, length);
                 }
             }
+            
         }
         gettimeofday(&end_time, 0);
         auto elapsed_time = end_time.tv_sec * 1000000 + end_time.tv_usec -
@@ -250,6 +260,9 @@ public:
         ALIGNED_MEM4K(buf, 1 << 20)
         struct iovec iov[8]{};
         for (size_t i = 0; i < nwrites; ++i) {
+            // off_t offset = 0;
+            // off_t length =  gen_write_data(buf, vsize, (128 * 1024), offset);
+            // LOG_DEBUG("offset: `, length: `", offset, length);
             off_t offset = DO_ALIGN(rand() % vsize);
             off_t length = DO_ALIGN(rand() % (128 * 1024));
             if ((uint64_t)(offset + length) > vsize)
@@ -260,40 +273,39 @@ public:
                 continue;
             }
             memset(buf, 0, length);
-            {
-                for (auto j = 0; j < length; j++) {
-                    auto k = rand() % 256;
-                    buf[j] = k; // j  & 0xff;
-                }
-                LOG_DEBUG("offset: `, length: `", offset, length);
-                auto slice_count = rand() % 4 + 1;
-                vector<int> seg_offset{0};
-                for (int i = 0; i < slice_count - 1; i++) {
-                    seg_offset.push_back(rand() % length);
-                }
-                seg_offset.push_back(length);
-                for (auto i = 0; i < slice_count; i++) {
-                    iov[i].iov_base = &buf[seg_offset[i]];
-                    iov[i].iov_len = seg_offset[i + 1] - seg_offset[i];
-                }
-                ssize_t ret = file0->pwritev(iov, slice_count, offset);
-                // ssize_t ret = file->pwrite(buf, length, offset);
-                if (ret != length) {
-                    LOG_ERROR("`(`)", errno, strerror(errno));
-                    exit(-1);
-                }
-                EXPECT_EQ(ret, length);
-
-                ret = file1->pwritev(iov, slice_count, offset);
-                if (ret != length) {
-                    LOG_ERROR("`(`)", errno, strerror(errno));
-                    exit(-1);
-                }
-                EXPECT_EQ(ret, length);
+            for (auto j = 0; j < length; j++) {
+                auto k = rand() % 256;
+                buf[j] = k; // j  & 0xff;
             }
+            LOG_DEBUG("offset: `, length: `", offset, length);
             if (FLAGS_verify) {
-                fcheck->pwrite(buf, offset, length);
+                fcheck->pwrite(buf, length, offset);
             }
+            auto slice_count = rand() % 4 + 1;
+            vector<int> seg_offset{0};
+            for (int i = 0; i < slice_count - 1; i++) {
+                seg_offset.push_back(rand() % length);
+            }
+            seg_offset.push_back(length);
+            for (auto i = 0; i < slice_count; i++) {
+                iov[i].iov_base = &buf[seg_offset[i]];
+                iov[i].iov_len = seg_offset[i + 1] - seg_offset[i];
+            }
+            ssize_t ret = file0->pwritev(iov, slice_count, offset);
+            // ssize_t ret = file->pwrite(buf, length, offset);
+            if (ret != length) {
+                LOG_ERROR("`(`)", errno, strerror(errno));
+                exit(-1);
+            }
+            EXPECT_EQ(ret, length);
+
+            ret = file1->pwritev(iov, slice_count, offset);
+            if (ret != length) {
+                LOG_ERROR("`(`)", errno, strerror(errno));
+                exit(-1);
+            }
+            EXPECT_EQ(ret, length);
+           
         }
         gettimeofday(&end_time, 0);
         auto elapsed_time = end_time.tv_sec * 1000000 + end_time.tv_usec -
@@ -355,7 +367,6 @@ public:
         EXPECT_EQ(file->lseek(0, SEEK_END), (off_t)vsize);
         ALIGNED_MEM4K(buf, 1 << 20)
         auto buf_len = PREAD_LEN;
-        char v[PREAD_LEN]{};
         for (off_t o = 0; o < (off_t)vsize; o += buf_len) {
             auto ret = file->pread(buf, buf_len, o);
             EXPECT_EQ(ret, (ssize_t)buf_len);
@@ -365,6 +376,8 @@ public:
             }
             if (!FLAGS_verify)
                 continue;
+            auto v = new char[buf_len];
+            DEFER(delete[] v);
             auto ret_v = fcheck->pread(v, buf_len, o);
             EXPECT_EQ(ret, ret_v);
             for (auto i = 0; i < buf_len; i++) {
@@ -479,23 +492,6 @@ public:
         lfs->unlink(data_name.back().c_str());
         lfs->unlink(idx_name.back().c_str());
         delete file;
-        // // auto tmp = ::open_file_ro(as);
-        // // UUID uuid;
-        // // tmp->get_uuid(uuid, 0);
-        // // parent_uuid = UUID::String(uuid).c_str();
-        // // LOG_INFO("reset parent_uuid: `", parent_uuid.c_str());
-        // if (compress) {
-        //     LOG_INFO("compress commit file and enable checksum.");
-        //     CompressOptions opt;
-        //     opt.verify = verify;
-        //     CompressArgs zfile_args(opt);
-        //     int ret = zfile_compress(as, dst, &zfile_args);
-        //     if (ret != 0) {
-        //         LOG_ERRNO_RETURN(0, nullptr, "compress commmit file failed.");
-        //     }
-        //     dst = ZFile::zfile_open_ro(dst, true);
-        //     return dst;
-        // }
         dst->close();
 
         dst = lfs->open(layer_name.back().c_str(), O_RDONLY);
@@ -574,5 +570,9 @@ public:
             lfs->unlink(fn_merged);
     }
     
+};
+
+class WarpFile : public FileTest3 {
+public:
     void randwrite_warpfile(IFile* file, size_t nwrites);
 };

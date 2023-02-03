@@ -38,6 +38,8 @@ static const int MAX_STACK_LAYERS = 255;
 
 class IFileRO : public VirtualReadOnlyFile {
 public:
+
+    static const int GetType = 12;
     // set MAX_IO_SIZE of per read/write operation.
     virtual int set_max_io_size(size_t) = 0;
     virtual size_t get_max_io_size() = 0;
@@ -110,17 +112,17 @@ struct LayerInfo {
 };
 
 struct FastImageArgs {
-    IFile *fmeta = nullptr; // sparse_file
-    IFile *fdata = nullptr;  // sparse_file
-    IFile *findex = nullptr;
+    IFile *fsmeta = nullptr; // sparse_file
+    IFile *target_file = nullptr;  // eg. remote target, local data file
+    IFile *lba_file = nullptr;  // lba pass from ioctl
     uint64_t virtual_size;
     UUID parent_uuid;
     UUID uuid;
     char *user_tag = nullptr; // a user provided string of message, 256B at most
     bool sparse_rw = false;
     size_t len = 0;           // len of user_tag; if it's 0, it will be detected with strlen()
-    FastImageArgs(IFile *_fmeta = nullptr, IFile *_fdata = nullptr, IFile *_findex = nullptr) 
-        : fmeta(_fmeta), fdata(_fdata), findex(_findex) {
+    FastImageArgs(IFile *fsmeta, IFile *target_file, IFile *lba_file) 
+        : fsmeta(fsmeta), target_file(target_file), lba_file(lba_file){
         parent_uuid.clear();
         uuid.generate();
     }
@@ -159,5 +161,6 @@ extern "C" int merge_files_ro(IFile **src_files, size_t n, const CommitArgs &arg
 // thus they will be destructed automatically.
 extern "C" IFileRW *stack_files(IFileRW *upper_layer, IFileRO *lower_layers, bool ownership = false,
                                 bool check_order = true);
+
 
 } // namespace LSMT
