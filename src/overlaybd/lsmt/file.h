@@ -112,18 +112,17 @@ struct LayerInfo {
 };
 
 struct FastImageArgs {
+    IFile *findex = nullptr;
     IFile *fsmeta = nullptr; // sparse_file
     IFile *target_file = nullptr;  // eg. remote target, local data file
     IFile *lba_file = nullptr;  // lba pass from ioctl
     uint64_t virtual_size;
-    UUID parent_uuid;
+    UUID::String parent_uuid;
     UUID uuid;
     char *user_tag = nullptr; // a user provided string of message, 256B at most
-    bool sparse_rw = false;
     size_t len = 0;           // len of user_tag; if it's 0, it will be detected with strlen()
-    FastImageArgs(IFile *fsmeta, IFile *target_file, IFile *lba_file) 
-        : fsmeta(fsmeta), target_file(target_file), lba_file(lba_file){
-        parent_uuid.clear();
+    FastImageArgs(IFile *findex, IFile *fsmeta, IFile *target_file, IFile *lba_file) 
+        : findex(findex), fsmeta(fsmeta), target_file(target_file), lba_file(lba_file){
         uuid.generate();
     }
 };
@@ -147,8 +146,12 @@ extern "C" IFileRO *open_file_ro(IFile *file, bool ownership = false);
 // thus they will be destructed automatically.
 extern "C" IFileRO *open_files_ro(IFile **files, size_t n, bool ownership = false);
 
-extern "C" IFileRW *create_warpfile(FastImageArgs &args, bool ownership);
+extern "C" IFileRW *create_warpfile(FastImageArgs &args, bool ownership = false);
 
+extern "C" IFileRW *open_warpfile_rw(IFile *findex, IFile *fsmeta_file, IFile *lba_file, 
+                                    IFile *target_file, bool ownership = false);
+
+extern "C" IFileRO *open_warpfile_ro(IFile *warpfile, IFile *target_file, bool ownership = false);
 
 // merge multiple RO files (layers) into a single RO file (layer)
 // returning 0 for success, -1 otherwise
