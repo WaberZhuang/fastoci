@@ -111,7 +111,7 @@ struct LayerInfo {
     }
 };
 
-struct FastImageArgs {
+struct WarpFileArgs {
     IFile *findex = nullptr;
     IFile *fsmeta = nullptr; // sparse_file
     IFile *target_file = nullptr;  // eg. remote target, local data file
@@ -121,7 +121,7 @@ struct FastImageArgs {
     UUID uuid;
     char *user_tag = nullptr; // a user provided string of message, 256B at most
     size_t len = 0;           // len of user_tag; if it's 0, it will be detected with strlen()
-    FastImageArgs(IFile *findex, IFile *fsmeta, IFile *target_file, IFile *lba_file) 
+    WarpFileArgs(IFile *findex, IFile *fsmeta, IFile *target_file, IFile *lba_file) 
         : findex(findex), fsmeta(fsmeta), target_file(target_file), lba_file(lba_file){
         uuid.generate();
     }
@@ -146,7 +146,7 @@ extern "C" IFileRO *open_file_ro(IFile *file, bool ownership = false);
 // thus they will be destructed automatically.
 extern "C" IFileRO *open_files_ro(IFile **files, size_t n, bool ownership = false);
 
-extern "C" IFileRW *create_warpfile(FastImageArgs &args, bool ownership = false);
+extern "C" IFileRW *create_warpfile(WarpFileArgs &args, bool ownership = false);
 
 extern "C" IFileRW *open_warpfile_rw(IFile *findex, IFile *fsmeta_file, IFile *lba_file, 
                                     IFile *target_file, bool ownership = false);

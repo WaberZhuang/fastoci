@@ -84,20 +84,16 @@ struct SegmentMapping : public Segment { // 64 + 55 + 9 == 128
     }
 } __attribute__((packed));
 
-struct RemoteLBA {
+struct RemoteMapping {
     off_t offset;
     uint32_t count;
     off_t roffset; 
 };
 
-struct WarpSegment : public LSMT::Segment {
-
-    enum class SegmentType {
-        fsMeta,
-        remoteData,
-    };
-
-} __attribute__((packed));
+enum class SegmentType {
+    fsMeta,
+    remoteData,
+};
 
 // a read-only memory index for log-structured data
 class IMemoryIndex {

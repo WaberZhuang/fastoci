@@ -742,7 +742,7 @@ void WarpFileTest::randwrite_warpfile(IFile* file, size_t nwrites) {
             }
             EXPECT_EQ(ret, length);
         } else {
-            RemoteLBA lba;
+            RemoteMapping lba;
             lba.count = length;
             lba.offset = offset;
             lba.roffset = offset;
@@ -761,7 +761,7 @@ IFileRW* WarpFileTest::create_warpfile_rw(int io_engine) {
     auto flba = lfs->open(data_name.back().c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRWXU);
     auto fmeta = lfs->open(idx_name.back().c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRWXU);
     LOG_INFO("create warpfile { fn_lba: `, fn_meta `}", data_name.back().c_str(), idx_name.back().c_str());
-    FastImageArgs args(findex, fmeta, fcheck, flba);
+    WarpFileArgs args(findex, fmeta, fcheck, flba);
     args.virtual_size = FLAGS_vsize << 20;
     memcpy(args.parent_uuid.data, parent_uuid.c_str(), parent_uuid.length());
     auto file = create_warpfile(args, true);
@@ -797,8 +797,16 @@ TEST_F(WarpFileTest, randwrite) {
     auto findex = lfs->open("rwtmp.index", O_RDWR | O_CREAT, S_IRWXU);
     auto flba = lfs->open(data_name.back().c_str(), O_RDWR | O_CREAT, S_IRWXU);
     auto fmeta = lfs->open(idx_name.back().c_str(), O_RDWR | O_CREAT, S_IRWXU);
-    file = open_warpfile_rw(findex, fmeta, flba, fcheck, true);
+    file = open_warpfile_rw(findex, fmeta, flba, fcheck, false);
     verify_file(file);
+    file->close();
+    LOG_INFO("commit warpfile as `", layer_name.back().c_str());
+    auto fcommit = lfs->open(layer_name.back().c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRWXU);
+    file = open_warpfile_rw(findex, fmeta, flba, nullptr, true);
+    CommitArgs c(fcommit);
+    ((IFileRW*)file)->commit(c); 
+    file->close();
+    verify_file(open_warpfile_ro(fcommit, fcheck, true));
     fcheck = nullptr;
     delete file;
 }
@@ -819,12 +827,12 @@ TEST_F(WarpFileTest, large_lba) {
     auto fidx = open_localfile_adaptor("/tmp/warpfile.idx",O_TRUNC|O_CREAT|O_RDWR);
     auto flba = open_localfile_adaptor("/tmp/warpfile.lba",O_TRUNC|O_CREAT|O_RDWR);
     auto fmeta = open_localfile_adaptor("/tmp/warpfile.meta",O_TRUNC|O_CREAT|O_RDWR);
-    FastImageArgs args(fidx, fmeta, fcheck, flba);
+    WarpFileArgs args(fidx, fmeta, fcheck, flba);
     args.virtual_size = FLAGS_vsize << 20;
     // Set memory file
     auto file = create_warpfile(args, true);
     DEFER(delete file);
-    RemoteLBA lba;
+    RemoteMapping lba;
     lba.count = 26<<20; // 26MB
     lba.offset = 0;
     lba.roffset = 0;
