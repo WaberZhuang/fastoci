@@ -26,6 +26,7 @@ IMemoryIndex -> IMemoryIndex0 -> IComboIndex -> Index0 ( set<SegmentMap> ) -> Co
 #include <inttypes.h>
 #include <cstddef>
 #include <assert.h>
+#include <sys/types.h>
 
 namespace LSMT {
 struct Segment {          // 48 + 18 == 64
@@ -54,15 +55,12 @@ struct SegmentMapping : public Segment { // 64 + 55 + 9 == 128
     uint64_t moffset : 55;               // mapped offset (2^64 B if in sector)
     uint32_t zeroed : 1;                 // indicating a zero-filled segment
     uint8_t tag;
-    uint64_t d_offset;
-    uint64_t padding_unused;
-
     const static uint64_t MAX_MOFFSET = (1UL << 55) - 1;
 
     SegmentMapping() {
     }
-    SegmentMapping(uint64_t loffset, uint32_t length, uint64_t moffset, uint8_t tag = 0, uint64_t d_offset = 0)
-        : Segment{loffset, length}, moffset(moffset), zeroed(0), tag(tag), d_offset(d_offset) {
+    SegmentMapping(uint64_t loffset, uint32_t length, uint64_t moffset, uint8_t tag = 0)
+        : Segment{loffset, length}, moffset(moffset), zeroed(0), tag(tag) {
         assert(length <= Segment::MAX_LENGTH);
     }
 
@@ -71,10 +69,7 @@ struct SegmentMapping : public Segment { // 64 + 55 + 9 == 128
     }
     void forward_offset_to(uint64_t x) {
         auto delta = Segment::forward_offset_to(x);
-        if (moffset != 0)
-            moffset += (!zeroed ? delta : 0);
-        else
-            d_offset += (!zeroed ? delta : 0);
+        moffset += (!zeroed ? delta : 0);
     }
     void backward_end_to(uint64_t x) {
         assert(x > offset);
@@ -88,6 +83,17 @@ struct SegmentMapping : public Segment { // 64 + 55 + 9 == 128
         return SegmentMapping(INVALID_OFFSET, 0, 0);
     }
 } __attribute__((packed));
+
+struct RemoteMapping {
+    off_t offset;
+    uint32_t count;
+    off_t roffset; 
+};
+
+enum class SegmentType {
+    fsMeta,
+    remoteData,
+};
 
 // a read-only memory index for log-structured data
 class IMemoryIndex {

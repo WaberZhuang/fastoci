@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #include "file.h"
+#include <cstdint>
+#include <openssl/bio.h>
 #include <string.h>
 #include <stdarg.h>
 #include <memory>
@@ -26,7 +28,12 @@ limitations under the License.
 #include <vector>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include "index.h"
+#include "photon/common/alog.h"
+#include "photon/common/uuid.h"
+#include "photon/fs/filesystem.h"
+#include "photon/fs/virtual-file.h"
 #include <photon/common/alog.h>
 #include <photon/common/utility.h>
 #include <photon/thread/thread.h>
@@ -46,6 +53,13 @@ LogBuffer &operator<<(LogBuffer &log, const SegmentMapping &m) {
     return log.printf((Segment &)m, "--> Mapping[", m.moffset + 0, ',', m.zeroed + 0, ',',
                       m.tag + 0, ']');
 }
+LogBuffer &operator<<(LogBuffer &log, const RemoteMapping &m) {
+    return log.printf("[offset: `, count: `, remote_offset: `]", m.offset + 0, m.count + 0,
+                      m.roffset + 0);
+}
+
+enum class LSMTFileType { RO, RW, SparseRW, WarpFileRO, WarpFile };
+
 struct HeaderTrailer {
     static const uint32_t SPACE = 4096;
     static const uint32_t TAG_SIZE = 256;
@@ -164,6 +178,7 @@ struct HeaderTrailer {
 
 } __attribute__((packed));
 
+
 class LSMTReadOnlyFile;
 static LSMTReadOnlyFile *open_file_ro(IFile *file, bool ownership, bool reserve_tag);
 
@@ -177,13 +192,13 @@ public:
     size_t MAX_IO_SIZE = 4 * 1024 * 1024;
     uint64_t m_vsize = 0;
     vector<IFile *> m_files;
-    vector<IFile *> m_r_files;
     vector<UUID> m_uuid;
     IMemoryIndex *m_index = nullptr;
     bool m_file_ownership = false;
     uint64_t m_data_offset = HeaderTrailer::SPACE / ALIGNMENT;
     uint32_t lsmt_io_cnt = 0;
     uint64_t lsmt_io_size = 0;
+    LSMTFileType m_filetype = LSMTFileType::RO;
 
     virtual ~LSMTReadOnlyFile() {
         LOG_INFO("pread times: `, size: `M", lsmt_io_cnt, lsmt_io_size >> 20);
@@ -192,9 +207,14 @@ public:
             LOG_DEBUG("m_file_ownership:`, m_files.size:`", m_file_ownership, m_files.size());
             for (auto &x : m_files)
                 safe_delete(x);
-            for (auto &x : m_r_files)
-                safe_delete(x);
         }
+    }
+
+    virtual int vioctl(int request, va_list args) override {
+        if (request == GetType) {
+            return (int)m_filetype;
+        }
+        LOG_ERROR_RETURN(EINVAL, -1, "invaid request code");
     }
 
     virtual int set_max_io_size(size_t _size) override {
@@ -219,9 +239,8 @@ public:
         safe_delete(m_index);
         if (m_file_ownership) {
             for (auto &x : m_files)
-                if (x) x->close();
-            for (auto &x : m_r_files)
-                if (x) x->close();
+                if (x)
+                    x->close();
         }
         return 0;
     }
@@ -250,8 +269,48 @@ public:
     if (!is_aligned((size) | (offset)))                                                            \
         LOG_ERROR_RETURN(EFAULT, -1, "arguments must be aligned!");
 
+    int lookup(void *buf, size_t count, off_t offset, vector<SegmentMapping> *hole) {
+        //!!!!
+        count /= ALIGNMENT;
+        offset /= ALIGNMENT;
+        Segment s{(uint64_t)offset, (uint32_t)count};
+        off_t buf_offset = 0;
+        auto ret = foreach_segments(
+            m_index, s,
+            [&](const Segment &m) __attribute__((always_inline)) {
+                auto step = m.length * ALIGNMENT;
+                if (hole != nullptr) {
+                    hole->push_back(SegmentMapping(m.offset, m.length, buf_offset));
+                } else {
+                    memset(buf, 0, step);
+                }
+                (char *&)buf += step;
+                buf_offset += m.length;
+                return 0;
+            },
+            [&](const SegmentMapping &m) __attribute__((always_inline)) {
+                if (m.tag >= m_files.size()) {
+                    LOG_DEBUG(" ` >= `", m.tag, m_files.size());
+                }
+                assert(m.tag < m_files.size());
+                ssize_t size = m.length * ALIGNMENT;
+                // LOG_DEBUG("offset: `, length: `", m.moffset, size);
+                ssize_t ret = m_files[m.tag]->pread(buf, size, m.moffset * ALIGNMENT);
+                if (ret < size) {
+                    LOG_ERRNO_RETURN(0, (int)ret,
+                                     "failed to read from `-th file ( ` pread return: ` < size: `)",
+                                     m.tag, m_files[m.tag], ret, size);
+                }
+                lsmt_io_size += ret;
+                lsmt_io_cnt++;
+                (char *&)buf += size;
+                buf_offset += m.length;
+                return 0;
+            });
+        return ret;
+    }
+
     virtual ssize_t pread(void *buf, size_t count, off_t offset) override {
-        LOG_INFO("pread ", VALUE(offset), VALUE(count));
         CHECK_ALIGNMENT(count, offset);
         auto nbytes = count;
         while (count > MAX_IO_SIZE) {
@@ -262,41 +321,7 @@ public:
             count -= MAX_IO_SIZE;
             offset += MAX_IO_SIZE;
         }
-        count /= ALIGNMENT;
-        offset /= ALIGNMENT;
-        Segment s{(uint64_t)offset, (uint32_t)count};
-        auto ret = foreach_segments(
-            m_index, s,
-            [&](const Segment &m) __attribute__((always_inline)) {
-                auto step = m.length * ALIGNMENT;
-                memset(buf, 0, step);
-                (char *&)buf += step;
-                return 0;
-            },
-            [&](const SegmentMapping &m) __attribute__((always_inline)) {
-                if (m.tag >= m_files.size()) {
-                    LOG_DEBUG(" ` >= `", m.tag, m_files.size());
-                }
-                assert(m.tag < m_files.size());
-                ssize_t size = m.length * ALIGNMENT;
-                LOG_INFO("read segment, offset: `, length: `", m.moffset, size);
-                ssize_t ret = 0;
-                if (m.d_offset > 0) {
-                    LOG_INFO("read from remote file, offset `, size `", m.d_offset * ALIGNMENT, size);
-                    ret = m_r_files[m.tag]->pread(buf, size, m.d_offset * ALIGNMENT);
-                } else {
-                    ret = m_files[m.tag]->pread(buf, size, m.moffset * ALIGNMENT);
-                }
-                if (ret < size) {
-                    LOG_ERRNO_RETURN(0, (int)ret,
-                                     "failed to read from `-th file ( ` pread return: ` < size: `)",
-                                     m.tag, m_files[m.tag], ret, size);
-                }
-                lsmt_io_size += ret;
-                lsmt_io_cnt++;
-                (char *&)buf += size;
-                return 0;
-            });
+        auto ret = lookup(buf, count, offset, nullptr);
         return (ret >= 0) ? nbytes : ret;
     }
 
@@ -327,7 +352,6 @@ public:
     }
     UNIMPLEMENTED(int close_seal(IFileRO **reopen_as = nullptr) override);
     UNIMPLEMENTED(int commit(const CommitArgs &args) const override);
-    UNIMPLEMENTED(int add_data_segment(off_t offset, size_t count, off_t d_offset) override);
 
     virtual DataStat data_stat() const override {
         uint64_t size = 0;
@@ -368,15 +392,19 @@ static int write_header_trailer(IFile *file, bool is_header, bool is_sealed, boo
     pht->index_offset = index_offset;
     pht->index_size = index_size;
     pht->virtual_size = args.virtual_size;
+    pht->set_uuid(args.uuid);
+    pht->parent_uuid = args.parent_uuid;
     if (pht->set_tag(args.user_tag, args.len) != 0)
         return -1;
     if (is_header) {
-        LOG_DEBUG("set header UUID");
+        LOG_INFO("write header {virtual_size: `, uuid: `, parent_uuid: `}",
+                args.virtual_size, pht->uuid.c_str(), pht->parent_uuid.c_str());
     } else {
-        LOG_DEBUG("set trailer UUID");
+        LOG_INFO("write trailer {index_offset: `, index_size: `, virtual_size: `, uuid: `, parent_uuid: `}",
+                pht->index_offset + 0, pht->index_size + 0, pht->virtual_size + 0, 
+                pht->uuid.c_str(), pht->parent_uuid.c_str());
     }
-    pht->set_uuid(args.uuid);
-    pht->parent_uuid = args.parent_uuid;
+    
     if (args.parent_uuid.is_null()) {
         LOG_WARN("parent_uuid is null.");
     }
@@ -394,6 +422,13 @@ struct CompactOptions {
     uint64_t io_usleep_time = 0;
     char *TRIM_BLOCK = nullptr;
     size_t trim_blk_size = 0;
+
+    CompactOptions(const vector<IFile *> *files, SegmentMapping *mapping, size_t index_size,
+                   size_t vsize, const CommitArgs *args)
+        : src_files((IFile **)&(*files)[0]), n(files->size()), raw_index(mapping),
+          index_size(index_size), virtual_size(vsize), commit_args(args) {
+        LOG_INFO("generate compact options, file count: `", n);
+    };
 };
 
 static int push_segment(char *buf, char *data, int &data_length, int &prev_end, int zero_detect,
@@ -549,10 +584,6 @@ static int compact(const CompactOptions &opt, atomic_uint64_t &compacted_idx_siz
             // there is no need do pcopy if current block is zero-marked.
             continue;
         }
-        if (m.d_offset != 0) {
-            compact_index.push_back(m);
-            continue;
-        }
         auto ret = pcopy(opt, m, moffset, compact_index);
         if (ret < 0)
             return (int)ret;
@@ -617,6 +648,7 @@ public:
 
     LSMTFile() {
         m_compacted_idx_size.store(0);
+        m_filetype = LSMTFileType::RW;
     }
 
     ~LSMTFile() {
@@ -632,6 +664,9 @@ public:
     }
 
     virtual int vioctl(int request, va_list args) override {
+        if (request == GetType) {
+            return LSMTReadOnlyFile::vioctl(request, args);
+        }
         if (request != Index_Group_Commit)
             LOG_ERROR_RETURN(EINVAL, -1, "invaid request code");
 
@@ -797,13 +832,8 @@ public:
         auto m_index0 = (IMemoryIndex0 *)m_index;
         unique_ptr<SegmentMapping[]> mapping(m_index0->dump());
 
-        CompactOptions opts;
-        opts.src_files = (IFile **)&m_files[0];
-        opts.n = m_files.size();
-        opts.raw_index = mapping.get();
-        opts.index_size = m_index->size();
-        opts.virtual_size = m_vsize;
-        opts.commit_args = &args;
+        CompactOptions opts(&m_files, mapping.get(), m_index->size(), m_vsize, &args);
+
         atomic_uint64_t _no_use_var(0);
         return compact(opts, _no_use_var);
     }
@@ -842,31 +872,6 @@ public:
             *reopen_as = p;
         }
         return close();
-    }
-
-    int add_data_segment(off_t offset, size_t count, off_t d_offset) override {
-        LOG_INFO("add segment {offset:`,length:`,roffset:`}", offset, count, d_offset);
-        CHECK_ALIGNMENT(count, offset);
-        auto bytes = count;
-
-        Lock lock(m_rw_mtx);
-        m_vsize = max(m_vsize, count + offset);
-        if (m_vsize < count + offset) {
-            LOG_INFO("resize m_visze: `->`", m_vsize, count + offset);
-        }
-        SegmentMapping m{
-            (uint64_t)offset / (uint64_t)ALIGNMENT,
-            (uint32_t)count / (uint32_t)ALIGNMENT,
-            0,
-            m_rw_tag,
-            (uint32_t)d_offset / (uint32_t)ALIGNMENT,
-        };
-        assert(m.length > (uint32_t)0);
-        m_data_offset = m.mend();
-        static_cast<IMemoryIndex0 *>(m_index)->insert(m);
-        append_index(m);
-
-        return bytes;
     }
 
     virtual int fsync() override {
@@ -914,6 +919,10 @@ class LSMTSparseFile : public LSMTFile {
 public:
     static const off_t BASE_MOFFSET = HeaderTrailer::SPACE;
 
+    LSMTSparseFile() {
+        m_filetype = LSMTFileType::SparseRW;
+    }
+
     virtual int close() override {
         return LSMTReadOnlyFile::close();
     }
@@ -941,8 +950,8 @@ public:
         {
             ret = m_files[m_rw_tag]->pwrite(buf, count, moffset);
             if (ret != (ssize_t)count) {
-                LOG_ERRNO_RETURN(0, -1, "write failed, file:`, ret:`, pos:`, count:`", m_files[m_rw_tag],
-                                 ret, moffset, count);
+                LOG_ERRNO_RETURN(0, -1, "write failed, file:`, ret:`, pos:`, count:`",
+                                 m_files[m_rw_tag], ret, moffset, count);
             }
             LOG_DEBUG("insert segment: `", m);
             static_cast<IMemoryIndex0 *>(m_index)->insert(m);
@@ -955,26 +964,28 @@ public:
         m.moffset = (uint64_t)(m.offset + (HeaderTrailer::SPACE / ALIGNMENT));
         LOG_DEBUG(m);
         static_cast<IMemoryIndex0 *>(m_index)->insert(m);
-        return m_files[m_rw_tag]->trim(m.offset * ALIGNMENT + HeaderTrailer::SPACE, m.length * ALIGNMENT);
+        return m_files[m_rw_tag]->trim(m.offset * ALIGNMENT + HeaderTrailer::SPACE,
+                                       m.length * ALIGNMENT);
     }
 
     // sparse RW File can't support these methods:
     // UNIMPLEMENTED(int commit(const CommitArgs &args) const override);
     UNIMPLEMENTED(int close_seal(IFileRO **reopen_as = nullptr) override);
 
-    static int create_mappings(const IFile *file, vector<SegmentMapping> &mappings) {
+    static int create_mappings(const IFile *file, vector<SegmentMapping> &mappings, 
+        off_t base = BASE_MOFFSET) {
 
-        auto moffset = BASE_MOFFSET;
+        auto moffset = base;
         while (true) {
-            auto begin = const_cast<IFile*>(file)->lseek(moffset, SEEK_DATA);
+            auto begin = const_cast<IFile *>(file)->lseek(moffset, SEEK_DATA);
             if (begin == -1)
                 break;
-            auto end =  const_cast<IFile*>(file)->lseek(begin, SEEK_HOLE);
+            auto end = const_cast<IFile *>(file)->lseek(begin, SEEK_HOLE);
             if (end == -1)
                 break;
             LOG_DEBUG("segment find: [ mbegin: `, mend: ` ]", begin, end);
             uint64_t total_length = (end - begin) / ALIGNMENT;
-            uint64_t prev_offset = ((uint64_t)begin - BASE_MOFFSET) / (uint64_t)ALIGNMENT;
+            uint64_t prev_offset = ((uint64_t)begin - base) / (uint64_t)ALIGNMENT;
             uint64_t prev_moffset = (uint64_t)(begin / ALIGNMENT);
             while (total_length > Segment::MAX_LENGTH) {
                 uint32_t length = Segment::MAX_LENGTH;
@@ -998,6 +1009,178 @@ public:
     }
 };
 
+class LSMTWarpFile : public LSMTFile {
+public:
+    const static int READ_BUFFER_SIZE = 65536;
+    LSMTWarpFile() {
+        m_filetype = LSMTFileType::WarpFile;
+    }
+    ssize_t pwrite(const void *buf, size_t count, off_t offset, SegmentType tag) {
+
+        auto moffset = offset;
+        SegmentMapping m{
+            (uint64_t)offset / (uint64_t)ALIGNMENT,
+            (uint32_t)count / (uint32_t)ALIGNMENT,
+            (uint64_t)moffset / (uint64_t)ALIGNMENT,
+        };
+        auto append = [&](const void *buf, SegmentMapping m) -> ssize_t {
+            ssize_t ret = -1;
+            m.tag = (uint8_t)tag;
+            auto file = m_files[(uint8_t)tag];
+            ret = file->pwrite(buf, count, offset);
+            LOG_DEBUG("insert segment: `, filePtr: `", m, file);
+            if (ret != (ssize_t)count) {
+                LOG_ERRNO_RETURN(0, -1, "write failed, file:`, ret:`, pos:`, count:`", file, ret,
+                                 moffset, count);
+            }
+            static_cast<IMemoryIndex0 *>(m_index)->insert(m);
+            append_index(m);
+            return ret;
+        };
+        if (tag == SegmentType::remoteData) {
+            m.moffset = ((RemoteMapping *)buf)->roffset / (uint64_t)ALIGNMENT;
+            auto limit_len = Segment::MAX_LENGTH;
+            size_t nwrite = 0;
+            size_t count = ((RemoteMapping *)buf)->count / (uint64_t)ALIGNMENT;
+            RemoteMapping lba = *(RemoteMapping *)buf;
+            while (count > 0) {
+                m.length = (limit_len < count ? limit_len : count);
+                lba.count = m.length * ALIGNMENT;
+                nwrite += append(&lba, m);
+                count -= m.length;
+                lba.offset += m.length * ALIGNMENT;
+                lba.roffset += m.length * ALIGNMENT;
+                m.forward_offset_to(m.offset + m.length);
+            }
+            return nwrite;
+        }
+        return append(buf, m);
+    }
+
+    virtual ssize_t pwrite(const void *buf, size_t count, off_t offset) override {
+        LOG_DEBUG("write fs meta {offset: `, len: `}", offset, count);
+        auto ret = pwrite(buf, count, offset, SegmentType::fsMeta);
+        if (ret != (ssize_t)count) {
+            LOG_ERRNO_RETURN(0, -1, "pwrite fsmeta failed.");
+        }
+        return count;
+    }
+
+    virtual int vioctl(int request, va_list args) override {
+        if (request == GetType) {
+            return LSMTReadOnlyFile::vioctl(request, args);
+        }
+        if (request != RemoteData)
+            LOG_ERROR_RETURN(EINVAL, -1, "invaid request code");
+
+        va_list tmp;
+        va_copy(tmp, args);
+        auto lba = va_arg(tmp, RemoteMapping);
+        va_end(tmp);
+        LOG_DEBUG("RemoteMapping: {offset: `, count: `, roffset: `}", lba.offset, lba.count,
+                  lba.roffset);
+        auto ret =
+            pwrite(&lba, (ssize_t)sizeof(lba), lba.offset, SegmentType::remoteData);
+        if (ret != ((lba.count / ALIGNMENT - 1) / Segment::MAX_LENGTH + 1) * sizeof(RemoteMapping)) {
+            LOG_ERRNO_RETURN(0, -1, "pwrite fsmeta failed.");
+        }
+        return 0;
+    }
+
+    class WarpFile : public VirtualReadOnlyFile {
+    public:
+        IFile *m_lba_file = nullptr;
+        IFile *m_target_file = nullptr;
+        WarpFile(IFile *lba_file, IFile *target_file)
+            : m_lba_file(lba_file), m_target_file(target_file) {
+        }
+
+        virtual ssize_t pwrite(const void *buf, size_t count, off_t offset) override {
+            auto lba = *(RemoteMapping *)buf;
+            LOG_DEBUG("write RemoteMapping {offset: `, len: `, roffset: `}", lba.offset, lba.count,
+                      lba.roffset);
+            auto ret = m_lba_file->pwrite(buf, sizeof(lba), offset);
+            if (ret != (ssize_t)count) {
+                LOG_ERRNO_RETURN(0, -1, "pwrite fsmeta failed.");
+            }
+            return count;
+        }
+
+        virtual ssize_t pread(void *buf, size_t count, off_t offset) override {
+            return m_target_file->pread(buf, count, offset);
+        }
+
+        virtual int fstat(struct stat *buf) override {
+            return m_target_file->fstat(buf);
+        }
+
+        UNIMPLEMENTED_POINTER(IFileSystem *filesystem() override);
+    };
+
+    size_t compact(CompactOptions &opts, size_t moffset, size_t &nindex) const {
+
+        auto dest_file = opts.commit_args->as;
+        auto marray = ptr_array(&opts.raw_index[0], opts.index_size);
+        vector<SegmentMapping> compact_index;
+        size_t compacted_idx_size = 0;
+        moffset /= ALIGNMENT;
+        for (auto &m : marray) {
+            if (m.tag == (uint8_t)SegmentType::remoteData) {
+                compact_index.push_back(m);
+                compacted_idx_size++;
+                continue;
+            }
+            compacted_idx_size++;
+            if (m.zeroed) {
+                m.moffset = moffset;
+                compact_index.push_back(m);
+                // there is no need do pcopy if current block is zero-marked.
+                continue;
+            }
+            auto ret = pcopy(opts, m, moffset, compact_index);
+            if (ret < 0)
+                return (int)ret;
+            moffset += ret;
+        }
+        uint64_t index_offset = moffset * ALIGNMENT;
+        auto index_size = compress_raw_index(&compact_index[0], compact_index.size());
+        LOG_DEBUG("write index to dest_file `, offset: `, size: `*`", dest_file, index_offset,
+                  index_size, sizeof(SegmentMapping));
+        auto nwrite = dest_file->write(&compact_index[0], index_size * sizeof(SegmentMapping));
+        if (nwrite != (ssize_t)index_size * sizeof(SegmentMapping)) {
+            LOG_ERRNO_RETURN(0, -1, "write index failed");
+        }
+        nindex = index_size;
+        auto pos = dest_file->lseek(0, SEEK_END);
+        LOG_INFO("write index done, file_size: `", pos);
+        return pos;
+    }
+
+    int commit(const CommitArgs &args) const override {
+
+        auto m_index0 = (IMemoryIndex0 *)m_index;
+        unique_ptr<SegmentMapping[]> mapping(m_index0->dump());
+        CompactOptions opts(&m_files, mapping.get(), m_index->size(), m_vsize, &args);
+        LayerInfo info;
+        info.virtual_size = m_vsize;
+        if (UUID::String::is_valid((args.parent_uuid).c_str())) {
+            LOG_INFO("set parent UUID: `", args.parent_uuid.data);
+            info.parent_uuid.parse(args.parent_uuid);
+        }
+        write_header_trailer(args.as, true, true, true, 0, 0, info);
+        size_t index_size = 0, index_offset = 0;
+        auto ret = compact(opts, HeaderTrailer::SPACE, index_size);
+        if (ret < 0) {
+            LOG_ERRNO_RETURN(0, -1, "compact data failed.");
+        }
+        index_offset = ret - index_size * sizeof(SegmentMapping);
+        LOG_INFO("compact data success, dest_file size: `", ret);
+        write_header_trailer(args.as, false, true, true, index_offset, index_size, info);
+        return 0;
+    }
+
+};
+
 HeaderTrailer *verify_ht(IFile *file, char *buf) {
     if (file == nullptr) {
         LOG_ERRNO_RETURN(0, nullptr, "invalid file ptr (null).");
@@ -1012,7 +1195,9 @@ HeaderTrailer *verify_ht(IFile *file, char *buf) {
     return pht;
 }
 
-static SegmentMapping *do_load_index(IFile *file, HeaderTrailer *pheader_trailer, bool trailer) {
+static SegmentMapping *do_load_index(IFile *file, HeaderTrailer *pheader_trailer, bool trailer,
+                                     bool keep_tag = false) {
+
     ALIGNED_MEM(buf, HeaderTrailer::SPACE, ALIGNMENT4K);
     auto pht = verify_ht(file, buf);
     if (pht == nullptr)
@@ -1063,7 +1248,7 @@ static SegmentMapping *do_load_index(IFile *file, HeaderTrailer *pheader_trailer
     for (size_t i = 0; i < pht->index_size; ++i)
         if (ibuf[i].offset != SegmentMapping::INVALID_OFFSET) {
             ibuf[index_size] = ibuf[i];
-            ibuf[index_size].tag = 0;
+            ibuf[index_size].tag = (keep_tag ? ibuf[i].tag : 0);
             index_size++;
         }
 
@@ -1077,7 +1262,7 @@ static SegmentMapping *do_load_index(IFile *file, HeaderTrailer *pheader_trailer
     return p;
 }
 
-static LSMTReadOnlyFile *open_file_ro(IFile *file, bool ownership, bool reserve_tag, IFile *r_file) {
+static LSMTReadOnlyFile *open_file_ro(IFile *file, bool ownership, bool reserve_tag) {
     if (!file) {
         LOG_ERROR("invalid file ptr. file: `", file);
         return nullptr;
@@ -1096,7 +1281,6 @@ static LSMTReadOnlyFile *open_file_ro(IFile *file, bool ownership, bool reserve_
     auto rst = new LSMTReadOnlyFile;
     rst->m_index = pi;
     rst->m_files = {file};
-    rst->m_r_files = {file};
     rst->m_uuid.resize(1);
     rst->m_uuid[0].parse(ht.uuid);
     rst->m_vsize = ht.virtual_size;
@@ -1106,8 +1290,8 @@ static LSMTReadOnlyFile *open_file_ro(IFile *file, bool ownership, bool reserve_
     return rst;
 }
 
-IFileRO *open_file_ro(IFile *file, bool ownership, IFile *data_file) {
-    return open_file_ro(file, ownership, true, data_file);
+IFileRO *open_file_ro(IFile *file, bool ownership) {
+    return open_file_ro(file, ownership, true);
 }
 
 IFileRW *open_file_rw(IFile *fdata, IFile *findex, bool ownership) {
@@ -1205,6 +1389,86 @@ IFileRW *create_file_rw(const LayerInfo &args, bool ownership) {
     return rst;
 }
 
+IFileRW *create_warpfile(WarpFileArgs &args, bool ownership) {
+    auto rst = new LSMTWarpFile;
+    rst->m_findex = args.findex;
+    LayerInfo info;
+    info.sparse_rw = false;
+    info.virtual_size = args.virtual_size;
+    info.parent_uuid.parse(args.parent_uuid);
+    info.uuid.parse(args.uuid);
+    write_header_trailer(rst->m_findex, true, false, false, HeaderTrailer::SPACE, 0, info);
+    rst->m_index = create_memory_index0((const SegmentMapping *)nullptr, 0, 0, 0);
+    rst->m_files.resize(2);
+    rst->m_files[(uint8_t)SegmentType::fsMeta] = args.fsmeta;
+    rst->m_files[(uint8_t)SegmentType::remoteData] =
+        new LSMT::LSMTWarpFile::WarpFile(args.lba_file, args.target_file);
+    rst->m_vsize = args.virtual_size;
+    rst->m_file_ownership = ownership;
+    UUID raw;
+    raw.parse(args.uuid);
+    rst->m_uuid.push_back(raw);
+    HeaderTrailer tmp;
+    tmp.version = 2;
+    tmp.sub_version = 0;
+    args.target_file->ftruncate(args.virtual_size);
+    args.fsmeta->ftruncate(args.virtual_size);
+    LOG_INFO("WarpImage Layer: { UUID:`, Parent_UUID: `, Virtual size: `, Version: `.` }", raw,
+             info.parent_uuid, rst->m_vsize, tmp.version, tmp.sub_version);
+    return rst;
+}
+
+IFileRW *open_warpfile_rw(IFile *findex, IFile *fsmeta_file, IFile *lba_file, IFile *target_file, bool ownership){
+    // TODO
+    auto rst = new LSMTWarpFile;
+    rst->m_files.resize(2);
+    // auto fsmeta = open_file_rw(fsmeta_file, nullptr, true); 
+    LSMT::HeaderTrailer ht;
+    auto p = do_load_index(findex, &ht, false, true);
+    auto pi = create_memory_index0(p, ht.index_size, 0, -1);
+    if (!pi) {
+        delete[] p;
+        LOG_ERROR_RETURN(0, nullptr, "failed to create memory index!");
+    }
+    rst->m_index = pi;
+    rst->m_findex = findex;
+    rst->m_files = {fsmeta_file, new LSMTWarpFile::WarpFile(lba_file, target_file)}; 
+    rst->m_uuid.resize(1);
+    rst->m_uuid[0].parse(ht.uuid);
+    rst->m_vsize = ht.virtual_size;
+    rst->m_file_ownership = ownership;
+    LOG_INFO("Layer Info: { UUID: `, Parent_UUID: `, Virtual size: `, Version: `.` }", ht.uuid,
+             ht.parent_uuid, rst->m_vsize, ht.version, ht.sub_version);
+    return rst;
+};
+
+IFileRO *open_warpfile_ro(IFile *warpfile, IFile *target_file, bool ownership) {
+    if (!warpfile) {
+        LOG_ERROR("invalid file ptr. file: `", warpfile);
+        return nullptr;
+    }
+    HeaderTrailer ht;
+    auto p = do_load_index(warpfile, &ht, true, true);
+    if (!p)
+        LOG_ERROR_RETURN(EIO, nullptr, "failed to load index from file.");
+    auto pi = create_memory_index(p, ht.index_size, 0, -1);
+    if (!pi) {
+        delete[] p;
+        LOG_ERROR_RETURN(0, nullptr, "failed to create memory index!");
+    }
+    auto rst = new LSMTReadOnlyFile;
+    rst->m_filetype = LSMTFileType::WarpFileRO;
+    rst->m_index = pi;
+    rst->m_files = {warpfile, target_file};
+    rst->m_uuid.resize(1);
+    rst->m_uuid[0].parse(ht.uuid);
+    rst->m_vsize = ht.virtual_size;
+    rst->m_file_ownership = ownership;
+    LOG_INFO("Layer Info: { UUID: `, Parent_UUID: `, Virtual size: `, Version: `.` }", ht.uuid,
+             ht.parent_uuid, rst->m_vsize, ht.version, ht.sub_version);
+    return rst;
+}
+
 struct parallel_load_task {
 
     IFile **files;
@@ -1252,6 +1516,23 @@ struct parallel_load_task {
     }
 };
 
+SegmentMapping *copy_lsmt_index(IFile *file, HeaderTrailer &ht) {
+    auto lsmtfile = (IFileRO *)file;
+    auto n = lsmtfile->index()->size();
+    auto nbytes = n * sizeof(SegmentMapping);
+    ht.index_size = n;
+    struct stat st;
+    lsmtfile->fstat(&st);
+    ht.virtual_size = st.st_size;
+    ht.index_offset = -1;
+    UUID uu;
+    ((IFileRO*)file)->get_uuid(uu);
+    ht.set_uuid(uu);
+    auto p = new SegmentMapping[nbytes];
+    memcpy(p, lsmtfile->index()->buffer(), nbytes);
+    return p;
+}
+
 void *do_parallel_load_index(void *param) {
     parallel_load_task *tm = (parallel_load_task *)param;
     while (true) {
@@ -1260,13 +1541,33 @@ void *do_parallel_load_index(void *param) {
             // error occured from another threads.
             return nullptr;
         }
-        auto p = do_load_index(job->get_file(), &job->ht, true);
-        if (!p) {
-            job->set_error(EIO);
-            LOG_ERROR_RETURN(0, nullptr, "failed to load index from `-th file", job->i);
+        auto file = job->get_file();
+        LOG_INFO("check file if normalfile or LSMTFile");
+        IMemoryIndex *pi = nullptr;
+        LSMT::SegmentMapping *p = nullptr;
+        auto type = file->ioctl(IFileRO::GetType);
+        auto verify_begin = HeaderTrailer::SPACE / ALIGNMENT;
+        if (type != -1) {
+            LOG_INFO("LSMTFileType of file ` is `.", file, type);
+            // copy idx
+            p = copy_lsmt_index(file, job->ht);
+            LOG_INFO("copy index and reset tag, count: `", (int)(job->ht.index_size));
+            for (auto m = p; m < p + job->ht.index_size; m++) {
+                LOG_DEBUG("`", *m);
+                m->tag = 0;
+                m->moffset = m->offset;
+            }
+            verify_begin = 0;
+            
+        } else {
+            p = do_load_index(job->get_file(), &job->ht, true);
+            if (!p) {
+                job->set_error(EIO);
+                LOG_ERROR_RETURN(0, nullptr, "failed to load index from `-th file", job->i);
+            }
         }
-        auto pi = create_memory_index(p, job->ht.index_size, HeaderTrailer::SPACE / ALIGNMENT,
-                                      job->ht.index_offset / ALIGNMENT);
+        pi = create_memory_index(p, job->ht.index_size, verify_begin,
+                                 job->ht.index_offset / ALIGNMENT);
         if (!pi) {
             delete[] p;
             job->set_error(EIO);
@@ -1278,7 +1579,7 @@ void *do_parallel_load_index(void *param) {
 }
 
 static IMemoryIndex *load_merge_index(vector<IFile *> &files, vector<UUID> &uuid,
-                                      HeaderTrailer &ht, vector<IFile *> &data_files) {
+                                      HeaderTrailer &ht) {
     photon::join_handle *ths[PARALLEL_LOAD_INDEX];
     auto n = min(PARALLEL_LOAD_INDEX, (int)files.size());
     LOG_DEBUG("create ` photon threads to merge index", n);
@@ -1299,7 +1600,6 @@ static IMemoryIndex *load_merge_index(vector<IFile *> &files, vector<UUID> &uuid
     assert(tm.jobs.back().i == files.size() - 1);
     ht = tm.jobs.back().ht;
     std::reverse(files.begin(), files.end());
-    std::reverse(data_files.begin(), data_files.end());
     std::reverse(tm.indexes.begin(), tm.indexes.end());
     std::reverse(uuid.begin(), uuid.end());
     auto pmi = merge_memory_indexes((const IMemoryIndex **)&tm.indexes[0], tm.indexes.size());
@@ -1309,7 +1609,7 @@ static IMemoryIndex *load_merge_index(vector<IFile *> &files, vector<UUID> &uuid
     // all indexes will be deleted automatically by ptr_vector
 }
 
-IFileRO *open_files_ro(IFile **files, size_t n, bool ownership, IFile **data_files) {
+IFileRO *open_files_ro(IFile **files, size_t n, bool ownership) {
     if (n > MAX_STACK_LAYERS) {
         LOG_ERROR_RETURN(0, 0, "open too many files (` > `)", n, MAX_STACK_LAYERS);
     }
@@ -1318,16 +1618,14 @@ IFileRO *open_files_ro(IFile **files, size_t n, bool ownership, IFile **data_fil
 
     HeaderTrailer ht;
     vector<IFile *> m_files(files, files + n);
-    vector<IFile *> m_r_files(data_files, data_files + n);
     vector<UUID> m_uuid(n);
-    auto pmi = load_merge_index(m_files, m_uuid, ht, m_r_files);
+    auto pmi = load_merge_index(m_files, m_uuid, ht);
     if (!pmi)
         return nullptr;
 
     auto rst = new LSMTReadOnlyFile;
     rst->m_index = pmi;
     rst->m_files = move(m_files);
-    rst->m_r_files = move(m_r_files);
     rst->m_uuid = move(m_uuid);
     rst->m_vsize = ht.virtual_size;
     rst->m_file_ownership = ownership;
@@ -1342,8 +1640,7 @@ IFileRO *open_files_ro(IFile **files, size_t n, bool ownership, IFile **data_fil
 int merge_files_ro(vector<IFile *> files, const CommitArgs &args) {
     HeaderTrailer ht;
     vector<UUID> files_uuid(files.size());
-    vector<IFile*> ifs;
-    auto pmi = unique_ptr<IMemoryIndex>(load_merge_index(files, files_uuid, ht, ifs));
+    auto pmi = unique_ptr<IMemoryIndex>(load_merge_index(files, files_uuid, ht));
     if (!pmi)
         return -1;
 
@@ -1352,13 +1649,7 @@ int merge_files_ro(vector<IFile *> files, const CommitArgs &args) {
     unique_ptr<char[]> DISCARD_BLOCK(new char[ALIGNMENT]);
 
     atomic_uint64_t _no_use_var(0);
-    CompactOptions opts;
-    opts.src_files = (IFile **)&files[0];
-    opts.n = files.size();
-    opts.raw_index = ri.get();
-    opts.index_size = pmi->size();
-    opts.virtual_size = ht.virtual_size;
-    opts.commit_args = &args;
+    CompactOptions opts(&files, ri.get(), pmi->size(), ht.virtual_size, &args);
     int ret = compact(opts, _no_use_var);
     return ret;
 }
@@ -1420,18 +1711,16 @@ IFileRW *stack_files(IFileRW *upper_layer, IFileRO *lower_layers, bool ownership
     rst->m_vsize = u->m_vsize;
     rst->m_file_ownership = ownership;
     rst->m_files.reserve(1 + l->m_files.size());
-    rst->m_r_files.reserve(1 + l->m_r_files.size());
     rst->m_uuid.reserve(1 + l->m_uuid.size());
     for (auto &x : l->m_files)
         rst->m_files.push_back(x);
-    for (auto &x : l->m_r_files)
-        rst->m_r_files.push_back(x);
     for (auto &x : l->m_uuid)
         rst->m_uuid.push_back(x);
     // check order of image ro layers.
     if (check_order) {
         if (verify_order(rst->m_files, rst->m_uuid, 1) == false)
             return nullptr;
+        LOG_INFO("check layer's parent uuid success.");
     } else {
         LOG_WARN("STACK FILES WITHOUT CHECK ORDER!!!");
     }

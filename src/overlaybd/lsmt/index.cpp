@@ -522,8 +522,6 @@ inline bool within(uint64_t x, uint64_t y, uint64_t begin, uint64_t end, uint32_
 static bool verify_mapping_moffset(const SegmentMapping *pmappings, size_t n,
                                    uint64_t moffset_begin, uint64_t moffset_end) {
     for (auto &m : ptr_array(pmappings, n)) {
-        if (m.d_offset != 0)
-            continue;
         if (!within(m.moffset, m.mend(), moffset_begin, moffset_end, m.zeroed)) {
             LOG_INFO("m.offset: `, m.moffset: `, m.length: ` m.zeroed: `", m.offset, m.moffset,
                      m.length, m.zeroed);
@@ -623,8 +621,7 @@ size_t compress_raw_index(SegmentMapping *mapping, size_t n) {
     verify_mapping_moffset(mapping, n, 0, INT64_MAX);
 
     for (j = 1, i = 0; j < n; ++j)
-        if (mapping[i].d_offset == 0 && mapping[j].d_offset == 0 &&
-            mapping[i].end() == mapping[j].offset && mapping[i].mend() == mapping[j].moffset &&
+        if (mapping[i].end() == mapping[j].offset && mapping[i].mend() == mapping[j].moffset &&
             (!(mapping[i].zeroed ^ mapping[j].zeroed)) && mapping[i].tag == mapping[j].tag &&
             (uint64_t)(mapping[i].length + mapping[j].length) < SegmentMapping::MAX_LENGTH) {
             mapping[i].length += mapping[j].length;
