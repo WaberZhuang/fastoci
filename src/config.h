@@ -26,8 +26,10 @@ struct LayerConfig : public ConfigUtils::Config {
     APPCFG_CLASS;
 
     APPCFG_PARA(file, std::string, "");
+    APPCFG_PARA(dataFile, std::string, "");
     APPCFG_PARA(dir, std::string, "");
     APPCFG_PARA(digest, std::string, "");
+    APPCFG_PARA(dataDigest, std::string, "");
     APPCFG_PARA(size, uint64_t, 0);
 };
 
