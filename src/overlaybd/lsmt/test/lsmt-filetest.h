@@ -211,8 +211,7 @@ public:
         struct iovec iov[8]{};
         for (size_t i = 0; i < nwrites; ++i) {
             off_t offset = 0;
-            off_t length =  gen_write_data(buf, vsize, (128 * 1024), offset);
-            
+            off_t length = gen_write_data(buf, vsize, (128 * 1024), offset);
             auto roll = rand() % 4;
             if (roll != 0) {
                 LOG_DEBUG("offset: `, length: `", offset, length);
@@ -244,7 +243,6 @@ public:
                     fcheck->fallocate(3, offset, length);
                 }
             }
-            
         }
         gettimeofday(&end_time, 0);
         auto elapsed_time = end_time.tv_sec * 1000000 + end_time.tv_usec -
@@ -305,7 +303,6 @@ public:
                 exit(-1);
             }
             EXPECT_EQ(ret, length);
-           
         }
         gettimeofday(&end_time, 0);
         auto elapsed_time = end_time.tv_sec * 1000000 + end_time.tv_usec -
@@ -329,7 +326,7 @@ public:
             LOG_ERROR("fallocate verify file failed.");
             return;
         }
-        
+
         struct stat st;
         fcheck->fstat(&st);
         EXPECT_EQ((uint64_t)st.st_size, vsize);
@@ -569,12 +566,12 @@ public:
         if (lfs->access(fn_merged, 0) == 0)
             lfs->unlink(fn_merged);
     }
-    
 };
 
 class WarpFileTest : public FileTest3 {
 public:
-    void randwrite_warpfile(IFile* file, size_t nwrites);
-    IFileRW* create_warpfile_rw(int io_engine = 0);
-    IFileRO* create_commit_warpfile(int io_engine = 0);
+    void randwrite_warpfile(IFile *file, size_t nwrites);
+    IFileRW *create_warpfile_rw(int io_engine = 0);
+    IFileRO *create_commit_warpfile(int io_engine = 0);
+    IFileRO *create_commit_warpfile(IFileRW* warpfile);
 };
