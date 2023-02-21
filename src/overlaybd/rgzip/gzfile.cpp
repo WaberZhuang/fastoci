@@ -34,9 +34,9 @@ public:
 
     UNIMPLEMENTED(ssize_t write(const void *buf, size_t count));
     UNIMPLEMENTED(ssize_t writev(const struct iovec *iov, int iovcnt));
-    
+
     UNIMPLEMENTED(ssize_t readv(const struct iovec *iov, int iovcnt));
-    
+
 
 private:
     IFile *gzip_file_ = nullptr;
@@ -150,15 +150,16 @@ static ssize_t extract(photon::fs::IFile *gzip_file, const struct IndexEntry *fo
     DEFER(inflateEnd(&strm));
 
     off_t start_pos = found_idx->en_pos - (found_idx->bits ? 1 : 0);
-    ret = gzip_file->lseek(start_pos, SEEK_SET);
-    if (ret == -1){
-    	LOG_ERRNO_RETURN(0, -1, "Fail to gzip_file->lseek(`, SEEK_SET)", start_pos);
-    }
+    // ret = gzip_file->lseek(start_pos, SEEK_SET);
+    // if (ret == -1){
+    // 	LOG_ERRNO_RETURN(0, -1, "Fail to gzip_file->lseek(`, SEEK_SET)", start_pos);
+    // }
     if (found_idx->bits) {
     	unsigned char tmp;
-    	if (gzip_file->read(&tmp, 1) != 1) {
+    	if (gzip_file->pread(&tmp, 1, start_pos) != 1) {
     		LOG_ERRNO_RETURN(0, -1, "Fail to gzip_file->read");
     	}
+        start_pos++;
     	ret = tmp;
     	inflatePrime(&strm, found_idx->bits, ret >> (8 - found_idx->bits));
     }
@@ -185,13 +186,14 @@ static ssize_t extract(photon::fs::IFile *gzip_file, const struct IndexEntry *fo
 
         do {
             if (strm.avail_in == 0) {
-                ssize_t read_cnt = gzip_file->read(input, CHUNK);
+                ssize_t read_cnt = gzip_file->pread(input, CHUNK, start_pos);
                 if (read_cnt < 0 ) {
                 	LOG_ERRNO_RETURN(0, -1, "Fail to gzip_file->read(input, CHUNK)");
                 }
                 if (read_cnt == 0) {
                 	LOG_ERRNO_RETURN(Z_DATA_ERROR, -1, "Fail to gzip_file->read(input, CHUNK)");
                 }
+                start_pos += read_cnt;
                 strm.avail_in = read_cnt;
                 strm.next_in = input;
             }

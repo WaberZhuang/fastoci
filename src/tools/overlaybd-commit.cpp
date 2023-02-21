@@ -63,9 +63,9 @@ int main(int argc, char **argv) {
            "--bs", block_size,
            "The size of a data block in KB. Must be a power of two between 4K~64K [4/8/16/32/64](default 4)");
     app.add_option("data_file", data_file_path, "data file path")->type_name("FILEPATH")->check(CLI::ExistingFile)->required();
-    app.add_option("lba_file", remote_mapping_file, "remoteLBA for warpfile")->type_name("FILEPATH")->check(CLI::ExistingFile);
     app.add_option("index_file", index_file_path, "index file path")->type_name("FILEPATH")->check(CLI::ExistingFile)->required();
     app.add_option("commit_file", commit_file_path, "commit file path")->type_name("FILEPATH")->required();
+    app.add_option("lba_file", remote_mapping_file, "remoteLBA for warpfile")->type_name("FILEPATH")->check(CLI::ExistingFile);
     CLI11_PARSE(app, argc, argv);
 
     set_log_output_level(1);
@@ -77,6 +77,7 @@ int main(int argc, char **argv) {
     IFile* flba = nullptr;
     IFileRW* fin = nullptr;
     if (not remote_mapping_file.empty()){
+        flba = open_file(remote_mapping_file.c_str(), O_RDONLY, 0);
         LOG_INFO("commit LSMTWarpFile with args: {fsmeta: `, remoteMapping: `, index_file: `",
             data_file_path, remote_mapping_file, index_file_path);
         fin = open_warpfile_rw(findex, fdata, flba, nullptr, true);
@@ -85,7 +86,7 @@ int main(int argc, char **argv) {
     }
     IFile* fout = open_file(commit_file_path.c_str(),  O_RDWR | O_EXCL | O_CREAT,
                     S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-   
+
     auto out = fout;
     IFile *zfile_builder = nullptr;
     ZFile::CompressOptions opt;

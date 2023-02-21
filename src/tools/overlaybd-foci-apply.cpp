@@ -90,7 +90,7 @@ int main(int argc, char **argv) {
         auto res = create_gz_index(tarf, 1024*1024, "gzip.meta");
         LOG_INFO("create_gz_index ", VALUE(res));
         tarf->lseek(0, 0);
-    
+
         src_file = open_gzfile_adaptor(input_path.c_str());
     } else {
         src_file = tarf;

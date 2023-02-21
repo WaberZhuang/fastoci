@@ -401,10 +401,10 @@ static int write_header_trailer(IFile *file, bool is_header, bool is_sealed, boo
                 args.virtual_size, pht->uuid.c_str(), pht->parent_uuid.c_str());
     } else {
         LOG_INFO("write trailer {index_offset: `, index_size: `, virtual_size: `, uuid: `, parent_uuid: `}",
-                pht->index_offset + 0, pht->index_size + 0, pht->virtual_size + 0, 
+                pht->index_offset + 0, pht->index_size + 0, pht->virtual_size + 0,
                 pht->uuid.c_str(), pht->parent_uuid.c_str());
     }
-    
+
     if (args.parent_uuid.is_null()) {
         LOG_WARN("parent_uuid is null.");
     }
@@ -972,7 +972,7 @@ public:
     // UNIMPLEMENTED(int commit(const CommitArgs &args) const override);
     UNIMPLEMENTED(int close_seal(IFileRO **reopen_as = nullptr) override);
 
-    static int create_mappings(const IFile *file, vector<SegmentMapping> &mappings, 
+    static int create_mappings(const IFile *file, vector<SegmentMapping> &mappings,
         off_t base = BASE_MOFFSET) {
 
         auto moffset = base;
@@ -1152,7 +1152,8 @@ public:
             LOG_ERRNO_RETURN(0, -1, "write index failed");
         }
         nindex = index_size;
-        auto pos = dest_file->lseek(0, SEEK_END);
+        // auto pos = dest_file->lseek(0, SEEK_END);
+        auto pos = index_offset + index_size * sizeof(SegmentMapping);
         LOG_INFO("write index done, file_size: `", pos);
         return pos;
     }
@@ -1418,8 +1419,10 @@ IFileRW *create_warpfile(WarpFileArgs &args, bool ownership) {
     HeaderTrailer tmp;
     tmp.version = 2;
     tmp.sub_version = 0;
-    args.target_file->ftruncate(args.virtual_size);
-    args.fsmeta->ftruncate(args.virtual_size);
+    if (args.target_file) {
+        args.target_file->ftruncate(args.virtual_size);
+    }
+    args.fsmeta->ftruncate(args.virtual_size + 4096);
     LOG_INFO("WarpImage Layer: { UUID:`, Parent_UUID: `, Virtual size: `, Version: `.` }", raw,
              info.parent_uuid, rst->m_vsize, tmp.version, tmp.sub_version);
     return rst;
@@ -1429,7 +1432,7 @@ IFileRW *open_warpfile_rw(IFile *findex, IFile *fsmeta_file, IFile *lba_file, IF
     // TODO
     auto rst = new LSMTWarpFile;
     rst->m_files.resize(2);
-    // auto fsmeta = open_file_rw(fsmeta_file, nullptr, true); 
+    // auto fsmeta = open_file_rw(fsmeta_file, nullptr, true);
     LSMT::HeaderTrailer ht;
     auto p = do_load_index(findex, &ht, false, true);
     auto pi = create_memory_index0(p, ht.index_size, 0, -1);
@@ -1439,7 +1442,7 @@ IFileRW *open_warpfile_rw(IFile *findex, IFile *fsmeta_file, IFile *lba_file, IF
     }
     rst->m_index = pi;
     rst->m_findex = findex;
-    rst->m_files = {fsmeta_file, new LSMTWarpFile::WarpFile(lba_file, target_file)}; 
+    rst->m_files = {fsmeta_file, new LSMTWarpFile::WarpFile(lba_file, target_file)};
     rst->m_uuid.resize(1);
     rst->m_uuid[0].parse(ht.uuid);
     rst->m_vsize = ht.virtual_size;
@@ -1565,7 +1568,7 @@ void *do_parallel_load_index(void *param) {
                 m->moffset = m->offset;
             }
             verify_begin = 0;
-            
+
         } else {
             p = do_load_index(job->get_file(), &job->ht, true);
             if (!p) {

@@ -33,6 +33,8 @@
 #include "image_file.h"
 #include "sure_file.h"
 #include "switch_file.h"
+#include "overlaybd/gzip/gz.h"
+#include "overlaybd/rgzip/gzfile.h"
 
 #define PARALLEL_LOAD_INDEX 32
 using namespace photon::fs;
@@ -259,6 +261,17 @@ int ImageFile::open_lower_layer(IFile *&file, IFile *&data_file, ImageConfigNS::
         LOG_INFO("open remote data file `", layer.dataDigest());
         data_file = __open_ro_data_remote(layer.dir(), layer.dataDigest(), 0, index);
     }
+    if (layer.gzipIndex() != "") {
+        auto gz_index = open_localfile_adaptor(layer.gzipIndex().c_str(), O_RDONLY, 0644, 0);
+        if (!gz_index) {
+            set_failed("failed to open gzip index " + layer.gzipIndex());
+            LOG_ERROR_RETURN(0, -1, "open(`),`:`", layer.gzipIndex(), errno, strerror(errno));
+        }
+        data_file = new_gzfile(data_file, gz_index);
+    }
+    if (data_file != nullptr) {
+        file = LSMT::open_warpfile_ro(file, data_file, false);
+    }
     if (file != nullptr) {
         LOG_DEBUG("layer index: `, open(`) success", index, opened);
         return 0;
@@ -304,7 +317,7 @@ LSMT::IFileRO *ImageFile::open_lowers(std::vector<ImageConfigNS::LayerConfig> &l
         }
     }
 
-    ret = LSMT::open_files_ro((IFile **)&(files[0]), lowers.size(), true, (IFile **)&(data_files[0]));
+    ret = LSMT::open_files_ro((IFile **)&(files[0]), lowers.size(), true);
     if (!ret) {
         LOG_ERROR("LSMT::open_files_ro(files, `, `) return NULL", lowers.size(), true);
         goto ERROR_EXIT;
@@ -332,9 +345,9 @@ ERROR_EXIT:
 LSMT::IFileRW *ImageFile::open_upper(ImageConfigNS::UpperConfig &upper) {
     IFile *data_file = NULL;
     IFile *idx_file = NULL;
+    IFile *warpIndex = NULL;
+    IFile *target_file = NULL;
     LSMT::IFileRW *ret = NULL;
-
-    LOG_INFO("upper layer : ` , `", upper.index(), upper.data());
 
     int dafa_file_flags = O_RDWR;
 
@@ -350,13 +363,45 @@ LSMT::IFileRW *ImageFile::open_upper(ImageConfigNS::UpperConfig &upper) {
         goto ERROR_EXIT;
     }
 
-    ret = LSMT::open_file_rw(data_file, idx_file, true);
-    if (!ret) {
-        LOG_ERROR("LSMT::open_file_rw(`,`,`) return NULL", (uint64_t)data_file, (uint64_t)idx_file,
-                  true);
-        goto ERROR_EXIT;
+    if (upper.warpIndex() != "") {
+        LOG_INFO("fastoci upper layer : `, `, `, `", upper.index(), upper.data(), upper.warpIndex());
+        // warp index
+        warpIndex = new_sure_file_by_path(upper.warpIndex().c_str(), O_RDWR, this);
+        if (!warpIndex) {
+            LOG_ERROR("open(`,flags), `:`", upper.warpIndex(), errno, strerror(errno));
+            goto ERROR_EXIT;
+        }
+        // target
+        if (upper.target() != "") {
+            target_file = new_sure_file_by_path(upper.target().c_str(), O_RDWR, this);
+            if (!target_file) {
+                LOG_ERROR("open(`,flags), `:`", upper.target(), errno, strerror(errno));
+                goto ERROR_EXIT;
+            }
+            if (upper.gzipIndex() != "") {
+                auto gzip_index = new_sure_file_by_path(upper.gzipIndex().c_str(), O_RDWR, this);
+                if (!gzip_index) {
+                    LOG_ERROR("open(`,flags), `:`", upper.gzipIndex(), errno, strerror(errno));
+                    goto ERROR_EXIT;
+                }
+                target_file = new_gzfile(target_file, gzip_index);
+            }
+        }
+        ret = LSMT::open_warpfile_rw(warpIndex, idx_file, data_file, target_file, true);
+        if (!ret) {
+            LOG_ERROR("LSMT::open_warpfile_rw(`,`,`) return NULL",
+                    (uint64_t)data_file, (uint64_t)idx_file, true);
+            goto ERROR_EXIT;
+        }
+    } else {
+        LOG_INFO("overlaybd upper layer : ` , `", upper.index(), upper.data());
+        ret = LSMT::open_file_rw(data_file, idx_file, true);
+        if (!ret) {
+            LOG_ERROR("LSMT::open_file_rw(`,`,`) return NULL",
+                    (uint64_t)data_file, (uint64_t)idx_file, true);
+            goto ERROR_EXIT;
+        }
     }
-
     return ret;
 
 ERROR_EXIT:

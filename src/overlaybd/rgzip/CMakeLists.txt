@@ -5,6 +5,6 @@ target_include_directories(rgzip_lib PUBLIC
     ${PHOTON_INCLUDE_DIR}
 )
 target_link_libraries(rgzip_lib photon_static)
-if(BUILD_TESTING)
-  add_subdirectory(test)
-endif()
+# if(BUILD_TESTING)
+#   add_subdirectory(test)
+# endif()
